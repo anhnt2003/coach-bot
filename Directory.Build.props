@@ -1,0 +1,15 @@
+<Project>
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <AnalysisLevel>latest-recommended</AnalysisLevel>
+    <!-- CA1848/CA1873: LoggerMessage source-gen is overkill for this app; CA1515: types are public for tests;
+         CA2007: no SynchronizationContext in this app; CA1062: nullable reference types cover this;
+         CA1031: background jobs intentionally catch-all and log. -->
+    <NoWarn>$(NoWarn);CA1848;CA1873;CA1515;CA2007;CA1062;CA1031;CA1303;CA1305;CA1307;CA1309;CA1310;CA1311;CA1304;CA1716;CA1720;CA1724;CA1002;CA1819;CA1056;CA1054;CA1055;CA2227;CA1711;CA1859;CA1822;CA1852</NoWarn>
+    <ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>
+  </PropertyGroup>
+</Project>

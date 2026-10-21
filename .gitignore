@@ -1,0 +1,22 @@
+# Build
+bin/
+obj/
+*.user
+.vs/
+.idea/
+TestResults/
+
+# Secrets & personal data — never commit
+.env
+.env.*
+!.env.example
+.local/
+
+# Supabase local state
+supabase/.branches
+supabase/.temp
+
+.DS_Store
+
+# Local CA certificates for TLS-inspecting networks
+certs/*.crt

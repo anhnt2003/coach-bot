@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup>
+    <ProjectReference Include="..\CoachBot.Core\CoachBot.Core.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+    <PackageReference Include="Npgsql.EntityFrameworkCore.PostgreSQL" />
+    <PackageReference Include="EFCore.NamingConventions" />
+    <PackageReference Include="ModelContextProtocol.Core" />
+    <PackageReference Include="Telegram.Bot" />
+    <PackageReference Include="Cronos" />
+    <PackageReference Include="Microsoft.Extensions.Http.Resilience" />
+  </ItemGroup>
+  <ItemGroup>
+    <EmbeddedResource Include="Localization\*.json" WithCulture="false" />
+    <EmbeddedResource Include="Llm\Prompts\*.md" />
+  </ItemGroup>
+  <ItemGroup>
+    <InternalsVisibleTo Include="CoachBot.Infrastructure.Tests" />
+    <InternalsVisibleTo Include="CoachBot.IntegrationTests" />
+  </ItemGroup>
+</Project>

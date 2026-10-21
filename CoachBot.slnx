@@ -1,0 +1,12 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/CoachBot.Core/CoachBot.Core.csproj" />
+    <Project Path="src/CoachBot.Host/CoachBot.Host.csproj" />
+    <Project Path="src/CoachBot.Infrastructure/CoachBot.Infrastructure.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/CoachBot.Core.Tests/CoachBot.Core.Tests.csproj" />
+    <Project Path="tests/CoachBot.Infrastructure.Tests/CoachBot.Infrastructure.Tests.csproj" />
+    <Project Path="tests/CoachBot.IntegrationTests/CoachBot.IntegrationTests.csproj" />
+  </Folder>
+</Solution>
