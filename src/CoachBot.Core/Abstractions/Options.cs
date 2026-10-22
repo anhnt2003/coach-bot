@@ -39,12 +39,14 @@ public sealed class SafetyOptions
     /// ~17 km peak long runs, too short for marathon preparation; 45% sits between Pfitzinger and Higdon.
     /// </summary>
     public double LongRunTargetShare { get; set; } = 0.45;
-    /// <summary>Hard ceiling enforced by the validator.</summary>
+    /// <summary>Most of the week the long run may be: a hard limit for the generator, a guideline for LLM designs.</summary>
     public double LongRunHardMaxShare { get; set; } = 0.50;
     public double LongRunCapKm { get; set; } = 32;
     public int LongRunCapMinutes { get; set; } = 195;
     public double LongRunMaxIncreaseKm { get; set; } = 3;
 
+    // Coaching guidelines: the rule-based generator follows them, but for LLM designs and adaptations they are only
+    // reported (Violation.IsGuideline): quality count, easy share, long-run share, per-session intensity caps.
     public int MaxQualityPerWeek { get; set; } = 2;
     public int MaxQualityPerWeekBase { get; set; } = 1;
     public double MinEasyShare { get; set; } = 0.75;

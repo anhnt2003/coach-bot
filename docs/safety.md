@@ -8,17 +8,26 @@ advice.**
 
 ## Who decides what
 
-The LLM proposes, the rules check. Nothing the LLM returns reaches the athlete's plan without passing the same
-validator as rule-based plans, and every load increase needs the athlete's explicit approval.
+The LLM coaches, the rules set the limits. The validator separates two kinds of checks:
+
+- **Enforced** — data integrity (steps add up, race on race day, one session per day, run-day limit, easy runs stay
+  easy) and injury ceilings (volume and long-run progression, long-run caps, taper). Nothing the LLM returns reaches
+  the plan while it breaks one of these.
+- **Guidelines** — coaching heuristics (quality sessions per week, ≥ 75% easy, time at intensity per session, hard-day
+  spacing, long-run share, usual intensities per session type). The rule-based generator follows them; for the LLM they
+  are defaults it may deliberately go beyond. They never reject a design or a change, and the athlete is told when a
+  plan goes beyond one (`Violation.IsGuideline`).
+
+Every load increase still needs the athlete's explicit approval.
 
 | Decision | Proposed by | Checked / decided by |
 |---|---|---|
 | Diagnosis (level, goal realism, limiters, risks, what each phase should develop) | **LLM**, from 8 weeks of runs, fitness data and notes | advice only: shown to the athlete and given to the plan design, run analysis and weekly report; it changes no number by itself |
-| Training plan (weeks, sessions, long-run build-up, cutbacks, taper) | **LLM**, starting from a rule-based baseline, its diagnosis and the athlete's notes | `PlanValidator`; on violations the LLM gets **one** repair attempt, then the rule-based plan is used (and the athlete is told) |
-| Workout content (e.g. 5 × 1 km at 5K pace, long run with a half-marathon-pace finish, hills, strides) | **LLM**, as structured steps with named intensities, chosen for the goal distance and the athlete's limiters | `PlanValidator`: intensities allowed per session type, time at each intensity per session, steps add up to the distance |
+| Training plan (weeks, sessions, long-run build-up, cutbacks, taper) | **LLM**, starting from a rule-based baseline, its diagnosis and the athlete's notes | `PlanValidator`: on enforced violations the LLM gets **one** repair attempt; what still breaks a limit is clamped by `PlanClamp` (a week over a ceiling is cut down to it, a week with unfixable errors is replaced by the baseline's week). Only if that fails is the rule-based plan used. The athlete is told in every case |
+| Workout content (e.g. 5 × 1 km at 5K pace, long run with a half-marathon-pace finish, hills, strides) | **LLM**, as structured steps with named intensities, chosen for the goal distance and the athlete's limiters | `PlanValidator`: steps add up to the distance and easy runs hide no hard work (enforced); time at intensity per session and the usual intensities per type are guidelines |
 | Paces and heart-rate targets | Rules, from measured fitness (`PaceZoneCalculator`) — never the LLM; the LLM only names the intensity | — |
 | Readiness (green/amber/red) | Rules (`ReadinessEvaluator`) | — |
-| Easing the plan (reduce, downgrade, rest, swap days) | Rules (`AdaptationEngine`) **and** the LLM | `PlanValidator`; rules win on conflicts; minor → auto-applied with Undo, otherwise approval |
+| Easing the plan (reduce, downgrade, rest, swap days) | Rules (`AdaptationEngine`) **and** the LLM | `PlanValidator` (enforced checks only); rules win on conflicts; minor → auto-applied with Undo, otherwise approval |
 | Progression (longer or harder sessions) | **LLM**, only on green days with ≥ medium confidence, ≤ +5 km per session | `PlanValidator` progression limits; never in taper or cutback weeks; **always** needs approval, sent separately from easing |
 | Pace updates after a fitness change | Rules (COROS threshold pace) | always needs approval |
 | Minor vs major | Rules (`ChangeClassifier`) | — |
@@ -27,7 +36,10 @@ validator as rule-based plans, and every load increase needs the athlete's expli
 
 With `Llm__Provider=none`, or when the LLM fails, CoachBot runs entirely on the rules.
 
-## Plan rules (enforced on rule-based and LLM-designed plans)
+## Plan rules
+
+Everything below binds the rule-based generator. For LLM designs and adaptations, the items marked *(guideline)* are
+advisory; the rest is enforced.
 
 Limits that depend on the goal distance (`SafetyOptions.ForRace`; the configured values are the marathon's, and shorter
 races never get higher ceilings than the configured ones, except the race-week shares: a shorter race tapers less):
@@ -46,27 +58,28 @@ races never get higher ceilings than the configured ones, except the race-week s
 - Start from the **4-week average** volume, never the peak. No history → 15 km/week with a warning.
 - Weekly volume rises at most **min(10%, +8 km)** over the last non-cutback week; **cutback every 4th week** (−25%).
 - Peak volume capped at max(base, min(cap, max(floor, multiplier × base))) km (table above).
-- Long run: grows by ≤ **3 km/week**, targets ≤ **45%** of the week (40/35/30% for half/10K/5K), hard caps **50%** and
-  the distance/duration caps above (at your slowest long-run pace, or 7:00/km when pace is unknown). *Deviation from
+- Long run: grows by ≤ **3 km/week**, targets ≤ **45%** of the week (40/35/30% for half/10K/5K), ≤ **50%** of the
+  week *(guideline)*, and the distance/duration caps above (at your slowest long-run pace, or 7:00/km when pace is unknown). *Deviation from
   the original plan (30%): with 30%, a typical runner peaking at ~57 km/week never ran longer than ~17 km, which does
   not prepare for a marathon.*
-- Hard sessions (tempo, intervals, race pace, long run, race) are never on consecutive days, including across
-  weeks; ≤ 1 quality session/week in the base phase, ≤ 2 otherwise; ≥ 75% of volume easy. Structured sessions count
+- *(guideline)* Hard sessions (tempo, intervals, race pace, long run, race) are never on consecutive days, including
+  across weeks; ≤ 1 quality session/week in the base phase, ≤ 2 otherwise; ≥ 75% of volume easy. Structured sessions count
   their steps (steady running half, marathon pace and faster fully); sessions without steps count a typical share
   (tempo 50%, intervals 40%, race pace 60%).
-- **Time at intensity per session** (Daniels' guidelines; share of that week's volume, with a minimum so low-volume
+- *(guideline)* **Time at intensity per session** (Daniels' guidelines; share of that week's volume, with a minimum so low-volume
   runners can still do a real session): threshold and 10K pace ≤ 10% (at least 4 km, at most 15 km); 5K pace and hills
   ≤ 8% (3 km, 10 km); repetition pace and strides ≤ 5% (1.6 km, 8 km); marathon and half-marathon pace ≤ 20% (6 km,
   29 km).
-- **Structured workouts**: each session type allows only certain intensities — easy runs: easy/recovery plus ≤ 12
-  strides of ≤ 30 s; long runs: easy, steady, marathon or half-marathon pace (fast finishes), nothing faster; tempo needs
-  threshold-type work; intervals need 5K/10K/repetition pace or hills; race-pace sessions need work at the goal race
-  pace; recoveries are never faster than steady. Steps must add up to the session distance (±10%, at least 1 km).
+- **Structured workouts**: easy and recovery runs contain only easy/recovery running plus strides of ≤ 30 s or 200 m;
+  recoveries are never faster than steady; steps must add up to the session distance (±10%, at least 1 km).
+  *(guideline)* ≤ 12 strides; long runs: easy, steady, marathon or half-marathon pace (fast finishes), nothing faster;
+  tempo needs threshold-type work; intervals need 5K/10K/repetition pace or hills; race-pace sessions need work at the
+  goal race pace.
 - Easy runs shorter than 5 km are dropped by the generator (rest day); no run of any plan may be under 3 km.
 - At most `run_days_per_week` run days, one session per day. Limits on long runs apply to the longest run of the week
   whatever it is labelled (a 35 km "easy" run is rejected).
 - **Taper:** the table above (marathon: 3 weeks for plans of 12+ weeks, 2 for 8–11); taper weeks only step down and
-  stay ≤ 85% of peak; the two days before the race are never hard. For any plan: exactly one race session on race day
+  stay ≤ 85% of peak; the two days before the race are never hard *(guideline)*. For any plan: exactly one race session on race day
   and nothing after it.
 - **Feasibility:** race < 1 week away, fewer than the minimum weeks without an experienced base (table above), or
   logged volume < 10 km/week → no plan, with an explanation. Fewer than the recommended weeks or volume under the

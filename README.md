@@ -9,8 +9,9 @@ COROS calendar, and talks to you through Telegram (English or Vietnamese).
 
 > **The LLM coaches, the rules check.** The AI coach diagnoses your fitness against the goal, designs the plan and
 > its workouts (intervals, tempos, race-pace blocks, hills, strides — as structured steps), and proposes adjustments
-> after each run. Every proposal must pass deterministic, unit-tested safety rules tuned per race distance
-> ([docs/safety.md](docs/safety.md)) or it is discarded (the rule-based plan is the fallback). Load increases always
+> after each run. Deterministic, unit-tested safety limits tuned per race distance ([docs/safety.md](docs/safety.md))
+> cover data integrity and injury ceilings only: a plan week that exceeds them is cut down to them, while coaching
+> heuristics (session mix, 80/20, spacing) are guidelines the AI may go beyond with a reason. Load increases always
 > wait for your approval, paces always come from measured fitness, and symptom screening combines keywords with LLM
 > triage. Not medical advice.
 
@@ -19,7 +20,7 @@ COROS calendar, and talks to you through Telegram (English or Vietnamese).
 | Area | Status |
 |---|---|
 | Goal races from 5K to marathon, with distance-specific safety limits | ✅ tested (plan grids for every distance) |
-| LLM diagnosis + LLM-designed plans with structured workouts, validation, one repair round, rule-based fallback | ✅ implemented, tested with a scripted LLM |
+| LLM diagnosis + LLM-designed plans with structured workouts, validation, one repair round, clamping to the limits, rule-based fallback | ✅ implemented, tested with a scripted LLM |
 | Plan validation, adaptation (rules + LLM easing/progression), approvals, undo, audit trail | ✅ implemented, unit + integration tested |
 | Readiness (HRV, resting HR, sleep, COROS recovery, load ratio, RPE/soreness) with missing-data handling | ✅ tested |
 | Red-flag symptoms: keywords (en + vi) + LLM triage (negation → confirm, LLM-only → pause) | ✅ tested |

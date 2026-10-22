@@ -103,7 +103,8 @@ public class LlmIntegrationTests(PostgresFixture pg)
         Assert.Contains(plan.Workouts, w => w.Description!.StartsWith("AI: relaxed", StringComparison.Ordinal));
         Assert.DoesNotContain("plan.llm_rejected", result.Warnings);
         var context = ScriptedLlm.Context(llm.Requests.Single(r => r.Purpose == "plan_design"));
-        Assert.NotNull(context["rules"]);
+        Assert.NotNull(context["limits"]);
+        Assert.NotNull(context["guidelines"]);
         Assert.Equal(athlete.RunDaysPerWeek, context["athlete"]!["run_days_per_week"]!.GetValue<int>());
     }
 
@@ -177,7 +178,7 @@ public class LlmIntegrationTests(PostgresFixture pg)
         // The diagnosis reached the plan design and is shown to the athlete.
         var design = ScriptedLlm.Context(llm.Requests.Single(r => r.Purpose == "plan_design"));
         Assert.Equal("threshold", design["assessment"]!["limiters"]![0]!["area"]!.GetValue<string>());
-        Assert.Contains("at half_marathon", design["rules"]!["session_intensities"]!["race_pace"]!.GetValue<string>(), StringComparison.Ordinal);
+        Assert.Contains("at half_marathon", design["guidelines"]!["session_intensities"]!["race_pace"]!.GetValue<string>(), StringComparison.Ordinal);
         var message = plans.RenderProposal(athlete, plan, (await scope.ServiceProvider.GetRequiredService<AthleteService>().GetActiveGoalAsync(athlete.Id, default))!, result.Warnings);
         Assert.Contains("🩺", message.Text, StringComparison.Ordinal);
         Assert.Contains("threshold (lactate) pace (no runs faster than easy pace in 8 weeks)", message.Text, StringComparison.Ordinal);
@@ -221,13 +222,12 @@ public class LlmIntegrationTests(PostgresFixture pg)
     }
 
     [Fact]
-    public async Task Unsafe_llm_plan_gets_one_repair_attempt_then_falls_back_to_the_rule_based_plan()
+    public async Task Unsafe_llm_plan_gets_one_repair_attempt_then_is_clamped_to_the_limits()
     {
         var llm = new ScriptedLlm((r, ctx) => r.Purpose switch
         {
             "plan_design" => ScriptedLlm.Design(ctx, Doubled),
-            "plan_design_repair" => ScriptedLlm.Design(ctx["context"]!, Doubled),
-            "plan_rationale" => """{"rationale":"rule plan explained","weekly_focus":[]}""",
+            "plan_design_repair" => ScriptedLlm.Design(ctx["context"]!, Doubled, rationale: "still too much"),
             _ => null,
         });
         var (sp, scope, athlete) = await SetupAsync(llm);
@@ -236,12 +236,45 @@ public class LlmIntegrationTests(PostgresFixture pg)
 
         var result = await scope.ServiceProvider.GetRequiredService<PlanService>().GenerateAsync(athlete, default);
 
-        Assert.Equal("rules", result.Plan!.GeneratedBy);
-        Assert.Contains("plan.llm_rejected", result.Warnings);
-        Assert.Equal("rule plan explained", result.Plan.Rationale);
+        var plan = result.Plan!;
+        Assert.StartsWith("llm:", plan.GeneratedBy, StringComparison.Ordinal);
+        Assert.Contains("plan.llm_clamped", result.Warnings);
+        Assert.DoesNotContain("plan.llm_rejected", result.Warnings);
+        Assert.Equal("still too much", plan.Rationale);
+        Assert.Contains(plan.Workouts, w => w.Description?.StartsWith("AI:", StringComparison.Ordinal) == true);
         var repair = ScriptedLlm.Context(llm.Requests.Single(r => r.Purpose == "plan_design_repair"));
         Assert.Contains("volume_increase_too_large", repair["violations"]!.ToJsonString(), StringComparison.Ordinal);
-        Assert.DoesNotContain(result.Plan.Workouts, w => w.Description?.StartsWith("AI:", StringComparison.Ordinal) == true);
+
+        var snapshot = CoachJson.Deserialize<PlanSnapshot>(plan.InputsJson)!;
+        var goal = (await scope.ServiceProvider.GetRequiredService<AthleteService>().GetActiveGoalAsync(athlete.Id, default))!;
+        Assert.DoesNotContain(new PlanValidator(new SafetyOptions().ForRace(goal.DistanceKm))
+            .ValidatePlan([.. plan.Workouts], snapshot.Baseline, snapshot.Zones, new PlanConstraints(goal.RaceDate, Math.Clamp(athlete.RunDaysPerWeek, 3, 6))), v => !v.IsGuideline);
+    }
+
+    [Fact]
+    public async Task Llm_plan_beyond_coaching_guidelines_is_accepted_without_repair()
+    {
+        static JsonObject AllQuality(JsonObject s)
+        {
+            if (s["type"]!.GetValue<string>() == "easy")
+            {
+                s["type"] = "tempo";
+            }
+
+            return s;
+        }
+
+        var llm = new ScriptedLlm((r, ctx) => r.Purpose == "plan_design" ? ScriptedLlm.Design(ctx, AllQuality) : null);
+        var (sp, scope, athlete) = await SetupAsync(llm);
+        await using var _ = sp;
+        await using var __ = scope;
+
+        var result = await scope.ServiceProvider.GetRequiredService<PlanService>().GenerateAsync(athlete, default);
+
+        Assert.StartsWith("llm:", result.Plan!.GeneratedBy, StringComparison.Ordinal);
+        Assert.DoesNotContain(llm.Requests, r => r.Purpose == "plan_design_repair");
+        Assert.Contains("plan.guideline.quality", result.Warnings);
+        Assert.Contains("plan.guideline.easy_share", result.Warnings);
     }
 
     [Fact]

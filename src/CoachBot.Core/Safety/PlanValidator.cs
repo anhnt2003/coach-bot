@@ -4,22 +4,47 @@ using CoachBot.Core.Planning;
 
 namespace CoachBot.Core.Safety;
 
-public sealed record Violation(string Code, int? WeekIndex, DateOnly? Date, string Detail);
+/// <param name="Limit">For violations that can be clamped: the most km the week (or its long run) may have.</param>
+public sealed record Violation(string Code, int? WeekIndex, DateOnly? Date, string Detail, double? Limit = null)
+{
+    /// <summary>
+    /// A coaching guideline (session mix, 80/20, dose per session, spacing): reported to the LLM and the athlete but never
+    /// grounds for rejecting a plan. Everything else is data integrity or an injury ceiling and is enforced.
+    /// </summary>
+    public bool IsGuideline => PlanValidator.GuidelineGroup(Code) is not null;
+}
 
 /// <summary>Athlete-specific limits a plan must respect in addition to the generic safety options.</summary>
 public sealed record PlanConstraints(DateOnly RaceDate, int RunDaysPerWeek);
 
 /// <summary>
-/// Hard safety gate. Every plan (rule-based or designed by the LLM) and every adaptation is checked here before it
-/// is stored or applied. The checks look at what a session actually is (distance, steps, intensity, date), not at its
-/// label, so a 35 km run labelled "easy" is still a long run and intervals hidden in an "easy" run are rejected.
+/// Safety gate. Every plan (rule-based or designed by the LLM) and every adaptation is checked here before it is stored
+/// or applied. The checks look at what a session actually is (distance, steps, intensity, date), not at its label, so a
+/// 35 km run labelled "easy" is still a long run and intervals hidden in an "easy" run are rejected. Only data integrity
+/// and injury ceilings are enforced; coaching heuristics come back as guideline violations (<see cref="Violation.IsGuideline"/>).
 /// Pass options already adjusted for the goal distance (<see cref="SafetyOptions.ForRace"/>).
 /// </summary>
 public sealed class PlanValidator(SafetyOptions options)
 {
     // Workout distances are rounded to 0.5 km, so allow one rounding step of slack.
-    private const double Tolerance = 0.51;
-    private const double MinRunKm = 3;
+    internal const double Tolerance = 0.51;
+    public const double MinRunKm = 3;
+
+    private static readonly Dictionary<string, string> Guidelines = new()
+    {
+        ["too_many_quality_sessions"] = "quality",
+        ["too_little_easy_running"] = "easy_share",
+        ["hard_days_back_to_back"] = "spacing",
+        ["hard_session_before_race"] = "spacing",
+        ["long_run_share_too_high"] = "long_share",
+        ["steps_intensity_unusual"] = "structure",
+        ["steps_missing_main_set"] = "structure",
+        ["strides_too_many"] = "structure",
+    };
+
+    /// <summary>The guideline family of a violation code (used for the athlete's warning), or null if it is enforced.</summary>
+    public static string? GuidelineGroup(string code) =>
+        Guidelines.TryGetValue(code, out var group) ? group : code.StartsWith("too_much_", StringComparison.Ordinal) ? "intensity" : null;
 
     public IReadOnlyList<Violation> ValidatePlan(
         IReadOnlyList<PlannedWorkout> workouts, PlanBaseline baseline, TrainingZones zones, PlanConstraints? constraints = null)
@@ -60,12 +85,12 @@ public sealed class PlanValidator(SafetyOptions options)
             {
                 if (km > peakKm * 0.85 + Tolerance)
                 {
-                    violations.Add(new("taper_not_reduced", weekIndex, null, $"{km:0.#} km vs peak {peakKm:0.#} km"));
+                    violations.Add(new("taper_not_reduced", weekIndex, null, $"{km:0.#} km vs peak {peakKm:0.#} km", peakKm * 0.85));
                 }
 
                 if (prevTaperKm is double prev && km > prev + Tolerance)
                 {
-                    violations.Add(new("taper_increases", weekIndex, null, $"{km:0.#} km after {prev:0.#} km"));
+                    violations.Add(new("taper_increases", weekIndex, null, $"{km:0.#} km after {prev:0.#} km", prev));
                 }
 
                 prevTaperKm = km;
@@ -81,7 +106,7 @@ public sealed class PlanValidator(SafetyOptions options)
             {
                 if (km > refKm + Tolerance)
                 {
-                    violations.Add(new("cutback_not_reduced", weekIndex, null, $"{km:0.#} km vs {refKm:0.#} km"));
+                    violations.Add(new("cutback_not_reduced", weekIndex, null, $"{km:0.#} km vs {refKm:0.#} km", refKm));
                 }
 
                 continue;
@@ -90,12 +115,13 @@ public sealed class PlanValidator(SafetyOptions options)
             var limit = Math.Min(refKm * (1 + options.MaxWeeklyIncreasePct), refKm + options.MaxWeeklyIncreaseKm);
             if (km > limit + Tolerance)
             {
-                violations.Add(new("volume_increase_too_large", weekIndex, null, $"{km:0.#} km vs limit {limit:0.#} km"));
+                violations.Add(new("volume_increase_too_large", weekIndex, null, $"{km:0.#} km vs limit {limit:0.#} km", limit));
             }
 
             if (longKm > refLong + options.LongRunMaxIncreaseKm + Tolerance)
             {
-                violations.Add(new("long_run_increase_too_large", weekIndex, null, $"{longKm:0.#} km after {refLong:0.#} km"));
+                violations.Add(new("long_run_increase_too_large", weekIndex, null, $"{longKm:0.#} km after {refLong:0.#} km",
+                    refLong + options.LongRunMaxIncreaseKm));
             }
 
             refKm = km;
@@ -111,12 +137,14 @@ public sealed class PlanValidator(SafetyOptions options)
             var peak = Math.Max(baseline.WeeklyKm, nonRaceWeeks.Take(Math.Max(1, weeks.Count - 1)).Max());
             if (nonRaceWeeks[^1] > peak * options.RaceWeekMaxShare + Tolerance)
             {
-                violations.Add(new("race_week_not_tapered", weeks[^1][0].WeekIndex, null, $"{nonRaceWeeks[^1]:0.#} km vs peak {peak:0.#} km"));
+                violations.Add(new("race_week_not_tapered", weeks[^1][0].WeekIndex, null, $"{nonRaceWeeks[^1]:0.#} km vs peak {peak:0.#} km",
+                    peak * options.RaceWeekMaxShare));
             }
 
             if (weeks.Count >= 8 && nonRaceWeeks[^2] > peak * options.PreRaceWeekMaxShare + Tolerance)
             {
-                violations.Add(new("pre_race_week_not_tapered", weeks[^2][0].WeekIndex, null, $"{nonRaceWeeks[^2]:0.#} km vs peak {peak:0.#} km"));
+                violations.Add(new("pre_race_week_not_tapered", weeks[^2][0].WeekIndex, null, $"{nonRaceWeeks[^2]:0.#} km vs peak {peak:0.#} km",
+                    peak * options.PreRaceWeekMaxShare));
             }
         }
 
@@ -249,7 +277,7 @@ public sealed class PlanValidator(SafetyOptions options)
 
             var problems = WorkoutStructure.Problems(w.Type, blocks, zones.RaceIntensity);
             violations.AddRange(problems.Select(p => new Violation(p.Code, w.WeekIndex, w.Date, p.Detail)));
-            if (problems.Count == 0 && blocks.Count > 0)
+            if (problems.All(p => GuidelineGroup(p.Code) is not null) && blocks.Count > 0)
             {
                 var total = WorkoutStructure.TotalKm(blocks, zones);
                 if (Math.Abs(total - w.TargetDistanceKm) > Math.Max(1, 0.1 * w.TargetDistanceKm))
@@ -335,13 +363,15 @@ public sealed class PlanValidator(SafetyOptions options)
     {
         if (longKm > options.LongRunCapKm + Tolerance)
         {
-            violations.Add(new("long_run_over_cap", weekIndex, null, $"{longKm:0.#} km > {options.LongRunCapKm} km"));
+            violations.Add(new("long_run_over_cap", weekIndex, null, $"{longKm:0.#} km > {options.LongRunCapKm} km", options.LongRunCapKm));
         }
 
-        var minutes = longKm * zones.SlowestPaceFor(WorkoutType.Long) / 60.0;
+        var pace = zones.SlowestPaceFor(WorkoutType.Long);
+        var minutes = longKm * pace / 60.0;
         if (minutes > options.LongRunCapMinutes + 1)
         {
-            violations.Add(new("long_run_over_duration_cap", weekIndex, null, $"~{minutes:0} min > {options.LongRunCapMinutes} min"));
+            violations.Add(new("long_run_over_duration_cap", weekIndex, null, $"~{minutes:0} min > {options.LongRunCapMinutes} min",
+                options.LongRunCapMinutes * 60.0 / pace));
         }
     }
 
