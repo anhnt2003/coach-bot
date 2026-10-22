@@ -26,18 +26,22 @@ public static partial class SymptomDetector
         (SymptomCategory.Illness, ["sốt", "cảm cúm", "cúm", "ớn lạnh", "nôn", "tiêu chảy", "viêm họng", "covid"]),
     ];
 
-    // Matched on word boundaries against lower-cased, diacritic-free text (also catches Vietnamese typed without accents).
+    // Matched on word boundaries against lower-cased, diacritic-free text. Also catches Vietnamese typed without accents;
+    // those entries are phrases because single words collide once accents are gone (xỉu/xíu "a little", sưng/sung sức "fit").
     private static readonly (SymptomCategory Category, string[] Phrases)[] Plain =
     [
         (SymptomCategory.Cardiac, ["chest pain", "chest tightness", "chest pressure", "tight chest", "faint", "fainted", "fainting",
             "passed out", "blacked out", "blackout", "palpitation", "palpitations", "irregular heartbeat", "heart racing",
             "racing heart", "short of breath", "shortness of breath", "can't breathe", "cant breathe", "dizzy", "dizziness",
-            "lightheaded", "light-headed", "dau nguc", "tuc nguc", "chong mat", "kho tho", "tim dap nhanh"]),
+            "lightheaded", "light-headed", "dau nguc", "tuc nguc", "chong mat", "kho tho", "tim dap nhanh", "tim dap loan",
+            "ngat xiu", "bi ngat", "bi xiu", "choang vang", "bi choang", "danh trong nguc", "hut hoi bat thuong"]),
         (SymptomCategory.Injury, ["sharp pain", "stabbing pain", "bone pain", "stress fracture", "fracture", "limp", "limping",
             "swelling", "swollen", "can't put weight", "cant put weight", "pain getting worse", "pain gets worse",
-            "worsening pain", "pain when walking", "dau xuong", "khap khieng"]),
+            "worsening pain", "pain when walking", "dau xuong", "khap khieng", "dau nhoi", "bi sung", "sung len", "sung to",
+            "sung phu", "gay xuong", "ran xuong", "dau tang khi chay", "khong the chay", "khong di duoc", "khong chiu duoc luc"]),
         (SymptomCategory.Illness, ["fever", "feverish", "flu", "chills", "vomiting", "vomited", "diarrhea", "diarrhoea",
-            "covid", "chest infection", "cam cum"]),
+            "covid", "chest infection", "cam cum", "bi sot", "sot cao", "phat sot", "con sot", "bi cum", "on lanh", "buon non",
+            "bi non", "non mua", "non oi", "tieu chay", "viem hong"]),
     ];
 
     public static SymptomAssessment Detect(string? text)

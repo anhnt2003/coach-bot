@@ -18,6 +18,7 @@
   "goal.invalid_distance": "Supported distances are 3 km to the marathon (42.195 km).",
   "profile.show": "Profile: {0} run days/week · long run on {1} · max HR {2} · born {3} · language {4}\nChange with /profile days=5 long=sun maxhr=188 born=1990 lang=vi",
   "profile.language_set": "Language set to English.",
+  "profile.language_usage": "Usage: /language en or /language vi",
   "plan.generating": "⏳ Building your plan from your recent training…",
   "plan.no_goal": "Set a race first: /goal YYYY-MM-DD [goal time] [name]",
   "plan.failed": "Could not generate a plan.",

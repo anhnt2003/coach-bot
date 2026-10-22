@@ -39,14 +39,16 @@ public static class AdaptationEngine
         }
 
         var redStreak = level == ReadinessLevel.Red && prev.Count > 0 && prev[0] == ReadinessLevel.Red;
-        var poorStreak = level != ReadinessLevel.Green && prev.Take(2).Count(l => l != ReadinessLevel.Green) == 2;
+        // "Amber 2 days running" = today and yesterday; prev never includes today.
+        var poorTwoDays = level != ReadinessLevel.Green && prev.Count > 0 && prev[0] != ReadinessLevel.Green;
+        var poorThreeDays = poorTwoDays && prev.Count > 1 && prev[1] != ReadinessLevel.Green;
 
-        if (redStreak || (level == ReadinessLevel.Red && poorStreak))
+        if (redStreak || (level == ReadinessLevel.Red && poorThreeDays))
         {
             return Deload(ctx.Today, upcoming);
         }
 
-        if (level == ReadinessLevel.Red || poorStreak)
+        if (level == ReadinessLevel.Red || poorTwoDays)
         {
             return EaseNextSession(ctx.Today, upcoming);
         }
@@ -175,8 +177,9 @@ public static class AdaptationEngine
             var rebuilt = c with { Date = w.Date, FromType = w.Type, FromKm = w.TargetDistanceKm, NewPaceMinSecPerKm = null, NewPaceMaxSecPerKm = null };
             switch (c.Action)
             {
+                // Rest is only reachable through ConvertToRest, which the classifier judges as dropping the session.
                 case ChangeAction.ReduceDistance or ChangeAction.Downgrade when c.ToKm > 0 && c.ToKm <= w.TargetDistanceKm
-                                                                             && c.ToType != WorkoutType.Race
+                                                                             && c.ToType is not (WorkoutType.Race or WorkoutType.Rest)
                                                                              && c.ToType.IntensityRank() <= w.Type.IntensityRank():
                     easing.Add(rebuilt with { NewDate = null });
                     break;
@@ -187,11 +190,11 @@ public static class AdaptationEngine
                                                 && !workouts.Values.Any(o => o.Date == target && o.Type == WorkoutType.Race):
                     easing.Add(rebuilt with { ToType = w.Type, ToKm = w.TargetDistanceKm });
                     break;
-                case ChangeAction.IncreaseDistance when mayProgress && c.ToKm > w.TargetDistanceKm
+                case ChangeAction.IncreaseDistance when mayProgress && AcceptsExtraLoad(w) && c.ToKm > w.TargetDistanceKm
                                                        && c.ToKm <= w.TargetDistanceKm + MaxLlmSessionIncreaseKm:
                     progression.Add(rebuilt with { ToType = w.Type, NewDate = null });
                     break;
-                case ChangeAction.Upgrade when mayProgress && c.ToType.IntensityRank() > w.Type.IntensityRank() && c.ToType != WorkoutType.Race
+                case ChangeAction.Upgrade when mayProgress && AcceptsExtraLoad(w) && c.ToType.IntensityRank() > w.Type.IntensityRank() && c.ToType != WorkoutType.Race
                                               && c.ToKm >= 3 && c.ToKm <= w.TargetDistanceKm + MaxLlmSessionIncreaseKm:
                     progression.Add(rebuilt with { NewDate = null });
                     break;
@@ -204,4 +207,7 @@ public static class AdaptationEngine
 
         return (easing, progression);
     }
+
+    /// <summary>Taper and cutback weeks keep their purpose: never a target for extra load.</summary>
+    private static bool AcceptsExtraLoad(PlannedWorkout w) => w.Phase != PlanPhase.Taper && !w.IsCutbackWeek;
 }

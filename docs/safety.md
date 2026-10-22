@@ -30,7 +30,7 @@ With `Llm__Provider=none`, or when the LLM fails, CoachBot runs entirely on the 
 ## Plan rules (enforced on rule-based and LLM-designed plans)
 
 Limits that depend on the goal distance (`SafetyOptions.ForRace`; the configured values are the marathon's, and shorter
-races never get higher ceilings than the configured ones):
+races never get higher ceilings than the configured ones, except the race-week shares: a shorter race tapers less):
 
 | | Marathon | Half marathon | 10K | 5K |
 |---|---|---|---|---|

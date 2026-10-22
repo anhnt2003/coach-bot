@@ -102,7 +102,7 @@ public sealed class CorosConnectService(
     }
 
     /// <summary>
-    /// Reuses the registered client for this issuer, or registers one (RFC 7591).
+    /// Reuses the registered client for this issuer and redirect URI, or registers one (RFC 7591).
     /// Verified live (2026-10-21): COROS registers every dynamic client as public (auth "none", no secret) with only the
     /// authorization_code + refresh_token grants, even when the device grant or a secret is requested. A secret is still
     /// stored and used if the server ever issues one.
@@ -110,9 +110,12 @@ public sealed class CorosConnectService(
     private async Task<OAuthClient> EnsureClientAsync(Guid athleteId, ProtectedResourceMetadata resource, AuthServerMetadata server, CancellationToken ct)
     {
         var connection = await db.CorosConnections.FirstOrDefaultAsync(c => c.AthleteId == athleteId, ct);
-        if (connection is not null && connection.Issuer == server.Issuer && !string.IsNullOrEmpty(connection.ClientId))
+        // Clients registered before the redirect URI was stored are assumed to match, as they always were.
+        if (connection is not null && connection.Issuer == server.Issuer && !string.IsNullOrEmpty(connection.ClientId)
+            && (connection.RedirectUri is null || connection.RedirectUri == RedirectUri))
         {
             connection.McpUrl = resource.Resource;
+            connection.RedirectUri = RedirectUri;
             await db.SaveChangesAsync(ct);
             return new OAuthClient(connection.ClientId, connection.EncryptedClientSecret is null ? null : cipher.Decrypt(connection.EncryptedClientSecret));
         }
@@ -136,6 +139,7 @@ public sealed class CorosConnectService(
         connection.Issuer = server.Issuer;
         connection.ClientId = client.Id;
         connection.EncryptedClientSecret = client.Secret is null ? null : cipher.Encrypt(client.Secret);
+        connection.RedirectUri = RedirectUri;
         connection.UpdatedAt = now;
         await db.SaveChangesAsync(ct);
         return client;

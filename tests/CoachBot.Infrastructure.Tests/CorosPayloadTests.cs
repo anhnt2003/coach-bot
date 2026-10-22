@@ -86,4 +86,16 @@ public class CorosPayloadTests
         Assert.False(args.ContainsKey("limit"));
         Assert.False(args.ContainsKey("days"));
     }
+
+    [Fact]
+    public void Dates_follow_the_schema_format_when_the_name_matches_exactly()
+    {
+        var schema = Parse("""
+            {"type":"object","properties":{"startdate":{"type":"string","description":"yyyyMMdd"}},"required":["startdate"]}
+            """);
+
+        var args = CorosToolArgs.Build(schema, new Dictionary<string, object?> { ["startdate"] = new DateOnly(2026, 10, 14) }, out _);
+
+        Assert.Equal("20261014", args["startdate"]);
+    }
 }

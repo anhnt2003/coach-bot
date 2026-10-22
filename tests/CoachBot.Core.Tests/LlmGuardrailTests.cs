@@ -130,4 +130,21 @@ public class LlmGuardrailTests
             Zones, allowIncrease: false);
         Assert.Contains("adaptation_increases_volume", withoutApproval.Select(v => v.Code));
     }
+
+    [Fact]
+    public void Approved_upgrades_at_the_same_distance_are_still_checked()
+    {
+        var draft = Baseline();
+        var before = draft.Workouts;
+        var validator = new PlanValidator(Options);
+
+        IReadOnlyList<Violation> Upgrade(PlannedWorkout target)
+        {
+            var change = new ProposedChange(target.Id, target.Date, ChangeAction.Upgrade, target.Type, WorkoutType.Interval, target.TargetDistanceKm, target.TargetDistanceKm);
+            return validator.ValidateAdaptation(before, PlanAdjuster.Preview(before, [change], Zones), Zones, allowIncrease: true);
+        }
+
+        Assert.Contains("taper_increase", Upgrade(before.First(w => w.Phase == PlanPhase.Taper && w.Type == WorkoutType.Easy)).Select(v => v.Code));
+        Assert.Contains("cutback_increase", Upgrade(before.First(w => w.IsCutbackWeek && w.Type == WorkoutType.Easy)).Select(v => v.Code));
+    }
 }

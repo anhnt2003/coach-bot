@@ -147,14 +147,21 @@ public sealed class PlanValidator(SafetyOptions options)
             var prev = beforeWeeks.TryGetValue(weekIndex, out var b) ? WeekKm(b) : km;
             var prevLong = b is null ? LongKm(items) : LongKm(b);
             var increased = km > prev + Tolerance || LongKm(items) > prevLong + Tolerance;
-            if (!increased)
+            // Same distance at a higher intensity (an easy run upgraded to intervals) is extra load too.
+            var harder = b is not null && WeekHardKm(items, zones) > WeekHardKm(b, zones) + Tolerance;
+            if (!increased && !harder)
             {
                 continue;
             }
 
             if (!allowIncrease)
             {
-                violations.Add(new("adaptation_increases_volume", weekIndex, null, $"{km:0.#} km vs {prev:0.#} km"));
+                // Without approval only volume is checked: moving a session between weeks may shift intensity.
+                if (increased)
+                {
+                    violations.Add(new("adaptation_increases_volume", weekIndex, null, $"{km:0.#} km vs {prev:0.#} km"));
+                }
+
                 continue;
             }
 
@@ -200,6 +207,9 @@ public sealed class PlanValidator(SafetyOptions options)
 
     private static double WeekKm(IReadOnlyList<PlannedWorkout> items) =>
         items.Where(w => w.Type != WorkoutType.Race).Sum(w => w.TargetDistanceKm);
+
+    private static double WeekHardKm(IReadOnlyList<PlannedWorkout> items, TrainingZones zones) =>
+        items.Where(w => w.Type != WorkoutType.Race).Sum(w => WorkoutStructure.HardKm(w, zones));
 
     /// <summary>The longest non-race run of the week, whatever it is labelled.</summary>
     private static double LongKm(IReadOnlyList<PlannedWorkout> items) =>
@@ -342,7 +352,7 @@ public sealed class PlanValidator(SafetyOptions options)
             return;
         }
 
-        var hardKm = items.Where(w => w.Type != WorkoutType.Race).Sum(w => WorkoutStructure.HardKm(w, zones));
+        var hardKm = WeekHardKm(items, zones);
         if (hardKm / km > 1 - options.MinEasyShare + 0.005)
         {
             violations.Add(new("too_little_easy_running", weekIndex, null, $"{hardKm / km:P0} hard"));

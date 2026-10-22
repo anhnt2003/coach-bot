@@ -40,6 +40,12 @@ public static partial class GoalParser
                 }
 
                 distance = km;
+                // "half marathon" / "full marathon" written as two words is still one distance.
+                if (tokens[i].ToLowerInvariant() is "half" or "full" && i + 1 < tokens.Length
+                    && tokens[i + 1].Equals("marathon", StringComparison.OrdinalIgnoreCase))
+                {
+                    tokens = [.. tokens[..(i + 1)], .. tokens[(i + 2)..]];
+                }
             }
             else if (time is null && TimeRegex().IsMatch(tokens[i]))
             {

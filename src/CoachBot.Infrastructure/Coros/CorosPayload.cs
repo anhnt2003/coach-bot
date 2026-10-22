@@ -49,24 +49,23 @@ public static class CorosToolArgs
 
     private static object? Resolve(string name, JsonElement prop, IReadOnlyDictionary<string, object?> desired)
     {
-        if (desired.TryGetValue(name, out var exact))
+        if (!desired.TryGetValue(name, out var value))
         {
-            return exact;
+            var lower = name.ToLowerInvariant();
+            var semantic = lower switch
+            {
+                "startdate" or "startday" => "startdate",
+                "enddate" or "endday" => "enddate",
+                _ => lower,
+            };
+
+            if (!desired.TryGetValue(semantic, out value))
+            {
+                return Missing;
+            }
         }
 
-        var lower = name.ToLowerInvariant();
-        var semantic = lower switch
-        {
-            "startdate" or "startday" => "startdate",
-            "enddate" or "endday" => "enddate",
-            _ => lower,
-        };
-
-        if (!desired.TryGetValue(semantic, out var value))
-        {
-            return Missing;
-        }
-
+        // Exact name matches too: a schema property named "startdate" still needs its declared date format.
         return value is DateOnly date ? FormatDate(date, prop) : value;
     }
 

@@ -108,8 +108,24 @@ public sealed class CronJobService(
             await Task.Delay(at - now, time, stoppingToken);
             foreach (var (job, _) in next.Where(x => x.At == at))
             {
-                await RunAsync(job, at, stoppingToken);
+                await TryRunAsync(job, at, stoppingToken);
             }
+        }
+    }
+
+    /// <summary>
+    /// Runs a job, logging instead of throwing: an exception escaping ExecuteAsync would stop the whole host
+    /// (Telegram included), e.g. when the database is briefly unreachable.
+    /// </summary>
+    private async Task TryRunAsync(CoachJob job, DateTimeOffset occurrence, CancellationToken ct)
+    {
+        try
+        {
+            await RunAsync(job, occurrence, ct);
+        }
+        catch (Exception ex) when (!ct.IsCancellationRequested)
+        {
+            logger.LogError(ex, "Job {Job} could not run", job.Name);
         }
     }
 
@@ -121,7 +137,7 @@ public sealed class CronJobService(
             var missed = job.Schedule.GetOccurrences(now.AddHours(-options.Value.CatchUpHours), now, zone).LastOrDefault();
             if (missed != default)
             {
-                await RunAsync(job, missed, ct);
+                await TryRunAsync(job, missed, ct);
             }
         }
     }
@@ -188,7 +204,17 @@ public sealed class StartupChecks(IServiceScopeFactory scopes, IOptions<LlmOptio
 
         if (llm.Value.Provider == "gemini" && !string.IsNullOrWhiteSpace(llm.Value.ApiKey))
         {
-            await scope.ServiceProvider.GetRequiredService<GeminiLlmClient>().VerifyModelAsync(cancellationToken);
+            // Bounded: the client's retry budget would otherwise hold up startup for minutes when Gemini is unreachable.
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            timeout.CancelAfter(TimeSpan.FromSeconds(20));
+            try
+            {
+                await scope.ServiceProvider.GetRequiredService<GeminiLlmClient>().VerifyModelAsync(timeout.Token);
+            }
+            catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
+            {
+                logger.LogWarning(ex, "Could not verify the Gemini model at startup; LLM calls may fail");
+            }
         }
         else if (llm.Value.Provider == "none")
         {

@@ -86,8 +86,9 @@ public sealed class PlanGenerator(SafetyOptions options)
             return Infeasible("plan.infeasible_too_short");
         }
 
-        // Below ~10 km/week the first plan week would already be a large jump: build a base first.
-        if (hasHistory && input.RecentWeeklyKmAvg < 10)
+        // Below ~10 km/week the first plan week would already be a large jump: build a base first. Applies to any logged
+        // volume, however few weeks of it (under 1 km/week counts as no history and uses the default above).
+        if (input.RecentWeeklyKmAvg is >= 1 and < 10)
         {
             return Infeasible("plan.infeasible_low_base");
         }

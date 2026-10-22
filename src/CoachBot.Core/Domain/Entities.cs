@@ -38,6 +38,8 @@ public class CorosConnection
     public string ClientId { get; set; } = "";
     /// <summary>Set when registered as a confidential client (client_secret_basic).</summary>
     public string? EncryptedClientSecret { get; set; }
+    /// <summary>The redirect URI the client was registered with; null for clients registered before it was stored.</summary>
+    public string? RedirectUri { get; set; }
     public string? EncryptedAccessToken { get; set; }
     public string? EncryptedRefreshToken { get; set; }
     public DateTimeOffset? AccessTokenExpiresAt { get; set; }

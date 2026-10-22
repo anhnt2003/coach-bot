@@ -38,6 +38,12 @@ public sealed class ChangeClassifier(SafetyOptions options)
             return ChangeMagnitude.Major;
         }
 
+        // Dropping a key session is major whatever the change is called (a "reduction" to rest drops it too).
+        if (change.ToType == WorkoutType.Rest && change.FromType.IsHard())
+        {
+            return ChangeMagnitude.Major;
+        }
+
         switch (change.Action)
         {
             case ChangeAction.SwapDays:

@@ -178,6 +178,8 @@ public class ChangeClassifierTests
 
         var longRun = Workout(WorkoutType.Long, 20, Today);
         Assert.Equal(ChangeMagnitude.Major, Classify(longRun, new(longRun.Id, longRun.Date, ChangeAction.ConvertToRest, WorkoutType.Long, WorkoutType.Rest, 20, 0)));
+        // A "reduction" to rest drops the session just the same.
+        Assert.Equal(ChangeMagnitude.Major, Classify(longRun, new(longRun.Id, longRun.Date, ChangeAction.ReduceDistance, WorkoutType.Long, WorkoutType.Rest, 20, 17)));
     }
 
     [Fact]
@@ -225,6 +227,9 @@ public class SymptomDetectorTests
     [InlineData("chân bị sưng và đi khập khiễng", SymptomCategory.Injury)]
     [InlineData("I have a fever", SymptomCategory.Illness)]
     [InlineData("bị sốt từ tối qua", SymptomCategory.Illness)]
+    [InlineData("toi bi sot va buon non", SymptomCategory.Illness)]
+    [InlineData("dau nhoi o dau goi", SymptomCategory.Injury)]
+    [InlineData("hom qua bi ngat xiu khi chay", SymptomCategory.Cardiac)]
     public void Detects_red_flags_in_english_and_vietnamese(string text, SymptomCategory expected)
     {
         var result = SymptomDetector.Detect(text);
@@ -235,6 +240,7 @@ public class SymptomDetectorTests
     [Theory]
     [InlineData("Legs felt heavy but fine overall")]
     [InlineData("Chạy rất tốt, cảm thấy khỏe")]
+    [InlineData("chay cham mot xiu, thay sung suc")]
     [InlineData("influence of the heat")]
     [InlineData("")]
     [InlineData(null)]
@@ -290,6 +296,19 @@ public class AdaptationEngineTests
         var change = Assert.Single(p.Changes);
         Assert.Equal(ChangeAction.ConvertToRest, change.Action);
         Assert.Equal("adapt.red_day", p.ReasonKey);
+    }
+
+    [Fact]
+    public void Amber_two_days_running_eases_the_next_session_like_a_red_day()
+    {
+        var p = Propose(ReadinessLevel.Amber, ReadinessLevel.Amber, ReadinessLevel.Green);
+        var change = Assert.Single(p.Changes);
+        Assert.Equal(ChangeAction.ConvertToRest, change.Action);
+        Assert.Equal("adapt.red_day", p.ReasonKey);
+
+        // A deload still needs red two days running (or red after two poor days).
+        Assert.Equal("adapt.red_day", Propose(ReadinessLevel.Red, ReadinessLevel.Amber, ReadinessLevel.Green).ReasonKey);
+        Assert.Equal("adapt.deload", Propose(ReadinessLevel.Red, ReadinessLevel.Amber, ReadinessLevel.Amber).ReasonKey);
     }
 
     [Fact]
@@ -371,6 +390,27 @@ public class AdaptationEngineTests
         Assert.Empty(AdaptationEngine.MergeLlmProposals([], [increase, upgrade], byId, Today, Ready(ReadinessLevel.Amber)).Progression);
         Assert.Empty(AdaptationEngine.MergeLlmProposals([], [increase, upgrade], byId, Today, Ready(ReadinessLevel.Green, Confidence.Low)).Progression);
         Assert.Empty(AdaptationEngine.MergeLlmProposals([], [increase, upgrade], byId, Today, null).Progression);
+    }
+
+    [Fact]
+    public void Llm_reduction_to_rest_is_dropped()
+    {
+        var week = Week();
+        var toRest = new ProposedChange(week[3].Id, week[3].Date, ChangeAction.ReduceDistance, WorkoutType.Long, WorkoutType.Rest, 22, 18);
+        Assert.Empty(AdaptationEngine.MergeLlmProposals([], [toRest], week.ToDictionary(w => w.Id), Today, Ready(ReadinessLevel.Green)).Easing);
+    }
+
+    [Theory]
+    [InlineData(true, PlanPhase.Build)]
+    [InlineData(false, PlanPhase.Taper)]
+    public void Llm_progression_never_targets_cutback_or_taper_weeks(bool cutback, PlanPhase phase)
+    {
+        var week = Week();
+        week.ForEach(w => { w.IsCutbackWeek = cutback; w.Phase = phase; });
+        var increase = new ProposedChange(week[2].Id, week[2].Date, ChangeAction.IncreaseDistance, WorkoutType.Easy, WorkoutType.Easy, 8, 10);
+        var upgrade = new ProposedChange(week[0].Id, week[0].Date, ChangeAction.Upgrade, WorkoutType.Easy, WorkoutType.Tempo, 8, 8);
+
+        Assert.Empty(AdaptationEngine.MergeLlmProposals([], [increase, upgrade], week.ToDictionary(w => w.Id), Today, Ready(ReadinessLevel.Green)).Progression);
     }
 
     [Fact]

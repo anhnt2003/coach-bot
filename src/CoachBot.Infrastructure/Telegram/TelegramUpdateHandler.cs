@@ -107,6 +107,12 @@ public sealed partial class TelegramUpdateHandler(
                 await ProfileAsync(athlete, rest, ct);
                 break;
             case "/language":
+                if (rest.ToLowerInvariant() is not ("en" or "vi"))
+                {
+                    await ReplyAsync(fmt.T(lang, "profile.language_usage"), ct);
+                    break;
+                }
+
                 await athletes.UpdateProfileAsync(athlete, null, null, null, null, rest.ToLowerInvariant(), ct);
                 await ReplyAsync(fmt.T(athlete.Language, "profile.language_set"), ct);
                 break;

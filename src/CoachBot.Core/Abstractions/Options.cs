@@ -78,8 +78,9 @@ public sealed class SafetyOptions
 
     /// <summary>
     /// Limits for a goal race of <paramref name="distanceKm"/>. Shorter races get smaller long-run and volume ceilings,
-    /// a shorter taper and shorter minimum preparation. Ceilings never exceed the configured (marathon) values, so
-    /// lowering a marathon limit lowers it for every distance.
+    /// a shorter taper and shorter minimum preparation. Those ceilings never exceed the configured (marathon) values, so
+    /// lowering a marathon limit lowers it for every distance. The race-week shares are the exception: a shorter race
+    /// tapers less, so its race week may keep more of the peak than the configured marathon share.
     /// </summary>
     public SafetyOptions ForRace(double distanceKm)
     {

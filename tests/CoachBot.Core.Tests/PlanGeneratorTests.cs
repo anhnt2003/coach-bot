@@ -199,6 +199,10 @@ public class PlanGeneratorTests
         var draft = new PlanGenerator(Options).Generate(Inputs(weeks: 24, baseKm: 6, longest: 5));
         Assert.False(draft.Feasible);
         Assert.Contains("plan.infeasible_low_base", draft.Warnings);
+
+        var newRunner = new PlanGenerator(Options).Generate(Inputs(weeks: 24, baseKm: 6, longest: 5, history: 2));
+        Assert.False(newRunner.Feasible);
+        Assert.Contains("plan.infeasible_low_base", newRunner.Warnings);
     }
 
     [Fact]

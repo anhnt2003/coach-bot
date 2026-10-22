@@ -18,6 +18,7 @@
   "goal.invalid_distance": "Hỗ trợ cự ly từ 3 km đến marathon (42,195 km).",
   "profile.show": "Hồ sơ: {0} buổi chạy/tuần · chạy dài vào {1} · nhịp tim tối đa {2} · năm sinh {3} · ngôn ngữ {4}\nĐổi bằng /profile days=5 long=sun maxhr=188 born=1990 lang=en",
   "profile.language_set": "Đã chuyển sang tiếng Việt.",
+  "profile.language_usage": "Cú pháp: /language vi hoặc /language en",
   "plan.generating": "⏳ Đang xây giáo án từ dữ liệu tập gần đây của bạn…",
   "plan.no_goal": "Hãy đặt giải trước: /goal YYYY-MM-DD [thời gian mục tiêu] [tên]",
   "plan.failed": "Không tạo được giáo án.",

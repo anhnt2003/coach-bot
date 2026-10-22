@@ -187,6 +187,8 @@ public class GoalDistanceTests
     [Theory]
     [InlineData("2027-03-07 3:59 Hanoi Marathon", 42.195, 3 * 3600 + 59 * 60, "Hanoi Marathon")]
     [InlineData("2026-12-20 half 1:45", 21.0975, 6300, "Half Marathon")]
+    [InlineData("2026-12-20 half marathon 1:45", 21.0975, 6300, "Half Marathon")]
+    [InlineData("2027-03-07 Full Marathon 3:59 Hanoi", 42.195, 3 * 3600 + 59 * 60, "Hanoi")]
     [InlineData("2026-12-20 1:45 half VnExpress", 21.0975, 6300, "VnExpress")]
     [InlineData("2026-12-20 1:45 VnExpress Half Marathon", 21.0975, 6300, "VnExpress Half Marathon")]
     [InlineData("2026-12-20 Giải bán marathon Huế", 21.0975, null, "Giải bán marathon Huế")]
