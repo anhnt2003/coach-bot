@@ -1,11 +1,15 @@
 # CoachBot: a single container. The database is Supabase (hosted project, or `supabase start` locally).
-# Secrets come from .env (see .env.example). When the DB is local Supabase, set in .env:
+# Secrets come from .env (see .env.example). Optional .env.docker (gitignored) overrides values for the container only,
+# e.g. to reach a local Supabase while .env keeps 127.0.0.1 for the CLI:
 #   ConnectionStrings__Postgres=Host=host.docker.internal;Port=54322;Database=postgres;Username=postgres;Password=postgres
 services:
   coachbot:
     build: .
     image: coachbot:latest
-    env_file: .env
+    env_file:
+      - path: .env
+      - path: .env.docker
+        required: false
     environment:
       ASPNETCORE_ENVIRONMENT: Production
     ports:

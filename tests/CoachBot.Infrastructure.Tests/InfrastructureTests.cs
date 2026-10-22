@@ -237,12 +237,15 @@ public class GeminiClientTests
 {
     private const string Schema = """{"type":"object","properties":{"summary":{"type":"string"}},"required":["summary"]}""";
 
-    [Fact]
-    public async Task Sends_schema_constrained_request_with_key_in_header_only()
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")] // "Llm__BaseUrl=" as shipped in .env.example
+    public async Task Sends_schema_constrained_request_with_key_in_header_only(string? baseUrl)
     {
         var handler = new StubHandler(_ => StubHandler.Json(HttpStatusCode.OK,
             """{"candidates":[{"content":{"parts":[{"text":"{\"summary\":\"ok\"}"}]},"finishReason":"STOP"}],"usageMetadata":{"totalTokenCount":10}}"""));
-        var client = new GeminiLlmClient(new HttpClient(handler), Options.Create(new LlmOptions { Provider = "gemini", ApiKey = "k-123", Model = "gemini-flash-latest" }),
+        var client = new GeminiLlmClient(new HttpClient(handler),
+            Options.Create(new LlmOptions { Provider = "gemini", ApiKey = "k-123", Model = "gemini-flash-latest", BaseUrl = baseUrl }),
             NullLogger<GeminiLlmClient>.Instance);
 
         var json = await client.GenerateJsonAsync(new LlmRequest("test", "sys", "user", Schema), CancellationToken.None);

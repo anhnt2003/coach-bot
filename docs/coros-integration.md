@@ -16,19 +16,25 @@ real data (history queries only read rows from the active source).
 | Device authorization grant | ❌ `401` for dynamically registered clients (advertised in metadata, but not granted to DCR clients) → CoachBot uses **browser login with PKCE** instead |
 | Authorization request (PKCE S256 + RFC 8707 `resource`, localhost redirect URI) | ✅ accepted: `302` to the COROS account sign-in (`openus.coros.com`). Approval itself not completed yet |
 
-## Not yet verified (needs you to approve access once)
+## Verified live (2026-10-22, with a real account)
+
+| Check | Result |
+|---|---|
+| Token exchange + refresh (offline_access) | ✅ browser login (PKCE) stores tokens; region `mcpus` |
+| `tools/list` with a real token | ✅ 34 tools; **no tool publishes an output schema** |
+| Read tool output | ✅ **every read tool answers with human-readable text** (e.g. `Duration: 45:16 \| Distance: 7.02 km`), not JSON. `CorosText` parses it; the source text is stored with every row |
+| Read tool arguments | ✅ dates `yyyyMMdd`. `querySportRecords` lists every filter as required but describes them as "Optional": they are sent as `null`. `querySleepHrv` needs `startDate`, `endDate` and `days` (≤ 7 per call); 35-day `days` ranges are accepted |
+| Full sync (`coros sync full`) | ✅ 8 weeks of activities (runs, walks, swims with sport codes), 35 days of stress and training load (short/long-term load, load ratio), current recovery, VO2max, threshold pace, race predictions |
+
+Seen only as "no data" so far (the account had none): sleep score/duration, sleep HRV, resting HR. Those readers
+accept the obvious labelled forms (`Sleep Score: 81`, `Main Sleep: 7h 12min`, `Average HRV: 45 ms`,
+`2026-10-21: 51 bpm`) and never guess unlabelled numbers; check them with `coros discover` once such data exists.
+
+## Not yet verified
 
 | Item | How it gets verified |
 |---|---|
-| Token exchange + refresh (offline_access) | `coros login` → approve in browser → "Authorized" |
-| `tools/list` with a real token (34 tools documented) | printed by `coros login` |
-| **Output field mapping** of read tools (`querySportRecords`, `queryDailyHealthData`, `querySleepHrv`, `querySleepOverview`, `queryRecoveryStatus`, `queryTrainingLoadAssessment`, `queryFitnessAssessmentOverview`) | `coros discover` saves raw responses to `.local/coros-fixtures/<timestamp>/`; the tolerant mappers in `src/CoachBot.Infrastructure/Coros/CorosMcpGateway.Data.cs` are then confirmed or adjusted |
 | Input schema of the workout `course` object and write behaviour | `coros test-write <date>` creates one standalone workout; check it in the COROS app and delete it there (MCP tools cannot delete) |
-
-The read mappings are written defensively: arguments are built from the **live tool schemas** (names, required
-fields, date format), several candidate field names are accepted, items that lack required fields are skipped
-(never guessed), raw payloads are stored with every row, and a warning with the payload *shape* (no values) is
-logged if a non-empty response maps to nothing.
 
 **Automatic pushing to COROS stays off** (`Coros__EnableWorkoutPush=false`) until `coros test-write` has produced a
 workout you could see in the app. If the `course` schema requires fields CoachBot cannot fill, the push fails with
@@ -43,13 +49,14 @@ watch guide each repeat, but the `course` step schema is part of what `coros dis
 ```bash
 # .env: Coros__Mode=mcp  (and Coros__McpUrl=https://mcpeu.coros.com/mcp etc. if your account is in another region)
 dotnet run --project src/CoachBot.Host -- coros login
-dotnet run --project src/CoachBot.Host -- coros discover
+dotnet run --project src/CoachBot.Host -- coros discover        # records raw tool output to .local/ (read-only)
+dotnet run --project src/CoachBot.Host -- coros sync full       # imports 8 weeks of data, same as /sync full (read-only)
 dotnet run --project src/CoachBot.Host -- coros test-write 2026-11-05   # pick a date within 90 days
 # if the workout shows up correctly in the COROS app: delete it there, then set Coros__EnableWorkoutPush=true
 ```
 
-Share the *structure* of the files in `.local/coros-fixtures/` (they contain your personal health data — do not
-commit them) to finalize the mappings, then convert them into anonymized test fixtures.
+Files in `.local/coros-fixtures/` contain personal health data — never commit them. Test fixtures copy the format
+with made-up values (`CorosTextTests`).
 
 ## Known COROS MCP limits (from the official docs)
 

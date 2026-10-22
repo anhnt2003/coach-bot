@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using CoachBot.Core.Abstractions;
 using CoachBot.Core.Domain;
 using Microsoft.Extensions.Logging;
@@ -6,11 +7,14 @@ using static CoachBot.Infrastructure.Coros.CorosPayload;
 
 namespace CoachBot.Infrastructure.Coros;
 
-// Data mapping for the official COROS MCP tools (names and parameters per coroslab/COROS-MCP docs/en/tools.md).
-// Argument names/formats come from the live tool schemas; output field mapping is UNVERIFIED until checked against
-// real responses with `coros discover` (see docs/coros-integration.md). Raw payloads are stored with every row.
+// Data mapping for the official COROS MCP tools. Argument names/formats come from the live tool schemas; the read
+// tools answer with text, parsed by CorosText (formats verified live with `coros discover`, docs/coros-integration.md).
+// The source text is stored with every row.
 public sealed partial class CorosMcpGateway
 {
+    /// <summary>Longest range requested from the day-count tools (a full sync asks for 35 days of metrics).</summary>
+    private const int MaxMetricDays = 35;
+
     private Dictionary<string, JsonElement>? _schemas;
 
     public async Task<IReadOnlyList<ActivitySample>> GetActivitiesAsync(Guid athleteId, DateOnly from, DateOnly to, CancellationToken ct)
@@ -20,68 +24,38 @@ public sealed partial class CorosMcpGateway
         for (var start = from; start <= to; start = start.AddDays(7))
         {
             var end = start.AddDays(6) < to ? start.AddDays(6) : to;
-            var payload = await CallAsync(athleteId, "querySportRecords",
-                new Dictionary<string, object?> { ["startdate"] = start, ["enddate"] = end, ["limit"] = 50 }, required: true, ct);
-            if (payload is null)
+            if (await CallTextAsync(athleteId, "querySportRecords",
+                    new() { ["startdate"] = start, ["enddate"] = end, ["limit"] = 50 }, required: true, ct) is not { } text)
             {
                 continue;
             }
 
-            var mapped = 0;
-            foreach (var item in Items(payload.Value))
+            var records = CorosText.SportRecords(text);
+            foreach (var sample in records)
             {
-                if (MapActivity(item) is { } sample)
-                {
-                    result[sample.ExternalId] = sample;
-                    mapped++;
-                }
+                result[sample.ExternalId] = sample;
             }
 
-            if (mapped == 0 && Items(payload.Value).Any())
+            if (records.Count == 0 && text.Contains("LabelId", StringComparison.Ordinal))
             {
-                logger.LogWarning("querySportRecords returned items but none could be mapped; payload shape {Shape}. Run `coros discover`.", Shape(payload.Value));
+                logger.LogWarning("querySportRecords returned records that could not be read. Run `coros discover`.");
             }
         }
 
         return [.. result.Values];
     }
 
-    internal static ActivitySample? MapActivity(JsonElement item)
-    {
-        var id = Text(item, "labelId", "activityId", "id");
-        var start = Instant(item, "startTime", "startTimestamp", "beginTime", "startDateTime");
-        var distanceKm = Number(item, "distanceKm") ?? (Number(item, "distance", "totalDistance") is double d ? (d > 200 ? d / 1000 : d) : null);
-        var duration = Number(item, "durationSeconds", "totalTime", "duration", "workoutTime", "movingTime");
-        if (id is null || start is null || distanceKm is null || duration is null)
-        {
-            return null;
-        }
-
-        var seconds = (int)Math.Round(duration.Value > 200_000 ? duration.Value / 1000 : duration.Value);
-        var sport = Text(item, "sportType", "sportTypeCode", "sport", "mode");
-        return new ActivitySample(
-            ExternalId: id,
-            SportType: SportName(sport),
-            StartTime: start.Value,
-            DurationSeconds: seconds,
-            DistanceMeters: distanceKm.Value * 1000,
-            AvgPaceSecPerKm: PaceSeconds(item, "avgPace", "averagePace", "pace", "avgPaceSecPerKm"),
-            AvgHr: (int?)Number(item, "avgHr", "avgHeartRate", "averageHeartRate", "avgHeart"),
-            MaxHr: (int?)Number(item, "maxHr", "maxHeartRate", "maxHeart"),
-            ElevationGainM: Number(item, "elevGain", "elevationGain", "totalAscent", "ascent"),
-            AvgCadence: (int?)Number(item, "avgCadence", "cadence", "avgStepCadence"),
-            TrainingLoad: Number(item, "trainingLoad", "load", "tl"),
-            Name: Text(item, "name", "title"),
-            RawJson: item.GetRawText());
-    }
-
-    /// <summary>COROS sport codes: 100 run, 101 indoor run, 102 trail run, 103 track run (per COROS conventions; unverified).</summary>
+    /// <summary>COROS sport codes (from the querySportRecords tool description): 100 run, 101 indoor, 102 trail, 103 track, 104 hike, 2xx bike, 30x swim, 900 walk.</summary>
     internal static string SportName(string? sport) => sport?.ToLowerInvariant() switch
     {
         "100" or "run" or "running" or "outdoor run" => "run",
         "101" or "indoor run" or "treadmill" => "treadmill",
         "102" or "trail run" or "trail running" => "trail_run",
         "103" or "track run" => "track",
+        "104" or "hike" => "hike",
+        "200" or "201" or "202" or "203" or "204" or "205" or "299" => "bike",
+        "300" or "301" => "swim",
+        "900" or "walk" => "walk",
         null => "unknown",
         var s when s.Contains("run", StringComparison.Ordinal) => "run",
         var s => s,
@@ -89,95 +63,73 @@ public sealed partial class CorosMcpGateway
 
     public async Task<IReadOnlyList<DailyMetricSample>> GetDailyMetricsAsync(Guid athleteId, DateOnly from, DateOnly to, CancellationToken ct)
     {
-        var days = Math.Clamp(to.DayNumber - from.DayNumber + 1, 1, 30);
+        var days = Math.Clamp(to.DayNumber - from.DayNumber + 1, 1, MaxMetricDays);
         var byDate = new Dictionary<DateOnly, DailyMetricSample>();
 
-        void Merge(DateOnly date, Func<DailyMetricSample, DailyMetricSample> update) =>
-            byDate[date] = update(byDate.TryGetValue(date, out var s) ? s : new DailyMetricSample(date));
-
-        // Daily health summary: resting HR, stress, sleep.
-        if (await CallAsync(athleteId, "queryDailyHealthData", new Dictionary<string, object?> { ["days"] = days }, required: true, ct) is { } daily)
+        void Merge(DateOnly date, Func<DailyMetricSample, DailyMetricSample> update)
         {
-            foreach (var item in Items(daily))
+            if (date >= from && date <= to)
             {
-                if (Date(item, "date", "day", "happenDay", "dateTime") is DateOnly date && date >= from && date <= to)
-                {
-                    Merge(date, s => s with
-                    {
-                        RestingHr = (int?)Number(item, "rhr", "restingHr", "restingHeartRate") ?? s.RestingHr,
-                        StressAvg = (int?)Number(item, "avgStress", "stress", "stressAvg") ?? s.StressAvg,
-                        SleepMinutes = (int?)Number(item, "sleepMinutes", "totalSleepMinutes", "sleepDuration") ?? s.SleepMinutes,
-                        RawJson = item.GetRawText(),
-                    });
-                }
+                byDate[date] = update(byDate.TryGetValue(date, out var s) ? s : new DailyMetricSample(date));
+            }
+        }
+
+        if (await CallTextAsync(athleteId, "queryDailyHealthData", new() { ["days"] = days }, required: true, ct) is { } daily)
+        {
+            foreach (var (date, d) in CorosText.DailyHealth(daily))
+            {
+                Merge(date, s => s with { StressAvg = d.StressAvg ?? s.StressAvg, RestingHr = d.RestingHr ?? s.RestingHr, RawJson = d.Raw });
+            }
+        }
+
+        if (await CallTextAsync(athleteId, "queryRestingHeartRate", new() { ["days"] = days }, required: false, ct) is { } restingHr)
+        {
+            foreach (var (date, bpm) in CorosText.RestingHeartRate(restingHr))
+            {
+                Merge(date, s => s with { RestingHr = bpm });
             }
         }
 
         // Sleep HRV covers at most 7 days per call.
-        var hrvFrom = to.AddDays(-6) > from ? to.AddDays(-6) : from;
-        if (await CallAsync(athleteId, "querySleepHrv", new Dictionary<string, object?> { ["startdate"] = hrvFrom, ["enddate"] = to, ["days"] = 7 }, required: false, ct) is { } hrv)
+        for (var start = from; start <= to; start = start.AddDays(7))
         {
-            foreach (var item in Items(hrv))
+            var end = start.AddDays(6) < to ? start.AddDays(6) : to;
+            if (await CallTextAsync(athleteId, "querySleepHrv", new() { ["startdate"] = start, ["enddate"] = end, ["days"] = 7 }, required: false, ct) is { } hrv)
             {
-                if (Date(item, "date", "day", "happenDay") is DateOnly date && Number(item, "hrv", "avgHrv", "sleepHrv", "avgSleepHrv", "value") is double ms)
+                foreach (var (date, ms) in CorosText.SleepHrv(hrv))
                 {
                     Merge(date, s => s with { HrvMs = ms });
                 }
             }
         }
 
-        if (await CallAsync(athleteId, "querySleepOverview", new Dictionary<string, object?> { ["startdate"] = from, ["enddate"] = to, ["days"] = days }, required: false, ct) is { } sleep)
+        if (await CallTextAsync(athleteId, "querySleepOverview", new() { ["startdate"] = from, ["enddate"] = to, ["days"] = days }, required: false, ct) is { } sleep)
         {
-            foreach (var item in Items(sleep))
+            foreach (var (date, night) in CorosText.Sleep(sleep))
             {
-                if (Date(item, "date", "day", "happenDay") is DateOnly date)
-                {
-                    Merge(date, s => s with
-                    {
-                        SleepMinutes = (int?)Number(item, "totalSleepMinutes", "sleepMinutes", "totalMinutes") ?? s.SleepMinutes,
-                        SleepScore = (int?)Number(item, "sleepScore", "score") ?? s.SleepScore,
-                    });
-                }
+                Merge(date, s => s with { SleepScore = night.Score ?? s.SleepScore, SleepMinutes = night.Minutes ?? s.SleepMinutes });
             }
         }
 
-        // Current-only values belong to today.
-        if (await CallAsync(athleteId, "queryRecoveryStatus", new Dictionary<string, object?>(), required: false, ct) is { } recovery
-            && Number(recovery, "recoveryPct", "recovery", "recoveryPercent", "recoveryRate", "percentage") is double pct)
+        if (await CallTextAsync(athleteId, "queryTrainingLoadAssessment", new() { ["days"] = days }, required: false, ct) is { } load)
         {
-            Merge(to, s => s with { RecoveryPct = (int)Math.Round(pct) });
+            foreach (var (date, l) in CorosText.TrainingLoad(load))
+            {
+                Merge(date, s => s with { AcuteLoad = l.ShortTerm ?? s.AcuteLoad, ChronicLoad = l.LongTerm ?? s.ChronicLoad, LoadRatio = l.Ratio ?? s.LoadRatio });
+            }
         }
 
-        if (await CallAsync(athleteId, "queryTrainingLoadAssessment", new Dictionary<string, object?> { ["days"] = 7 }, required: false, ct) is { } load)
+        // Current-only value: it belongs to today.
+        if (await CallTextAsync(athleteId, "queryRecoveryStatus", new(), required: false, ct) is { } recovery && CorosText.RecoveryPct(recovery) is int pct)
         {
-            Merge(to, s => s with
-            {
-                LoadRatio = Number(load, "loadRatio", "ratio", "trainingLoadRatio", "acuteChronicRatio") ?? s.LoadRatio,
-                AcuteLoad = Number(load, "shortTermLoad", "acuteLoad", "atl") ?? s.AcuteLoad,
-                ChronicLoad = Number(load, "longTermLoad", "chronicLoad", "ctl") ?? s.ChronicLoad,
-            });
+            Merge(to, s => s with { RecoveryPct = pct });
         }
 
         return [.. byDate.Values.OrderBy(s => s.Date)];
     }
 
-    public async Task<FitnessSnapshot?> GetFitnessAsync(Guid athleteId, CancellationToken ct)
-    {
-        if (await CallAsync(athleteId, "queryFitnessAssessmentOverview", new Dictionary<string, object?>(), required: false, ct) is not { } payload)
-        {
-            return null;
-        }
-
-        var root = payload;
-        int? Prediction(params string[] names) => Number(root, names) is double s && s > 0 ? (int)s : null;
-        return new FitnessSnapshot(
-            Vo2Max: Number(root, "vo2max", "vo2Max", "VO2max"),
-            ThresholdPaceSecPerKm: PaceSeconds(root, "thresholdPace", "ltPace", "lactateThresholdPace"),
-            MarathonPredictionSeconds: Prediction("marathonPrediction", "marathonTime", "predictMarathon", "marathon"),
-            HalfMarathonPredictionSeconds: Prediction("halfMarathonPrediction", "halfMarathonTime", "predictHalfMarathon", "halfMarathon"),
-            LactateThresholdHr: (int?)Number(root, "thresholdHr", "ltHr", "lactateThresholdHr"),
-            RawJson: root.GetRawText());
-    }
+    public async Task<FitnessSnapshot?> GetFitnessAsync(Guid athleteId, CancellationToken ct) =>
+        await CallTextAsync(athleteId, "queryFitnessAssessmentOverview", new(), required: false, ct) is { } text ? CorosText.Fitness(text) : null;
 
     /// <summary>
     /// Creates (or updates) a standalone workout on the COROS calendar. The `course` object is built from the live
@@ -216,7 +168,8 @@ public sealed partial class CorosMcpGateway
         try
         {
             var result = await session.CallAsync(athleteId, tool, args, isWrite: true, ct);
-            var reference = Text(result, "idInPlan", "id", "workoutId") ?? Items(result).Select(i => Text(i, "idInPlan", "id")).FirstOrDefault(x => x is not null);
+            // Unverified (push is off): assumes the "idInPlan: 8" line that queryTrainingSchedule prints.
+            var reference = result.ValueKind == JsonValueKind.String && IdInPlan().Match(result.GetString()!) is { Success: true } m ? m.Groups["v"].Value : null;
             return new WorkoutPushResult(true, reference ?? workout.CorosRef, null);
         }
         catch (CorosToolException ex)
@@ -275,6 +228,26 @@ public sealed partial class CorosMcpGateway
 
     private async Task<Dictionary<string, JsonElement>> SchemasAsync(Guid athleteId, CancellationToken ct) =>
         _schemas ??= (await session.ListToolsAsync(athleteId, ct)).ToDictionary(t => t.Name, t => t.JsonSchema);
+
+    /// <summary>Calls a read tool and returns its text answer. Structured output would be new: it is logged, not guessed at.</summary>
+    private async Task<string?> CallTextAsync(Guid athleteId, string tool, Dictionary<string, object?> desired, bool required, CancellationToken ct)
+    {
+        if (await CallAsync(athleteId, tool, desired, required, ct) is not { } payload)
+        {
+            return null;
+        }
+
+        if (payload.ValueKind == JsonValueKind.String)
+        {
+            return payload.GetString();
+        }
+
+        logger.LogWarning("COROS {Tool} returned structured output {Shape} instead of text. Run `coros discover`.", tool, Shape(payload));
+        return null;
+    }
+
+    [GeneratedRegex(@"idInPlan:\s*(?<v>\w+)")]
+    private static partial Regex IdInPlan();
 
     /// <summary>Calls a read tool with schema-built arguments. Optional tools that are missing or fail yield null.</summary>
     private async Task<JsonElement?> CallAsync(Guid athleteId, string tool, Dictionary<string, object?> desired, bool required, CancellationToken ct)

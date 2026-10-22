@@ -49,7 +49,8 @@ public sealed class GeminiLlmClient(HttpClient http, IOptions<LlmOptions> option
     public bool IsEnabled => !string.IsNullOrWhiteSpace(options.Value.ApiKey);
     public string ProviderName => $"gemini:{options.Value.Model}";
 
-    private string BaseUrl => (options.Value.BaseUrl ?? DefaultBaseUrl).TrimEnd('/');
+    // .env.example ships "Llm__BaseUrl=" (empty), which binds as "" rather than null.
+    private string BaseUrl => (string.IsNullOrWhiteSpace(options.Value.BaseUrl) ? DefaultBaseUrl : options.Value.BaseUrl).TrimEnd('/');
 
     public async Task<string?> GenerateJsonAsync(LlmRequest request, CancellationToken ct)
     {

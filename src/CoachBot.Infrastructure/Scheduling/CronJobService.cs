@@ -43,7 +43,7 @@ public sealed class CronJobService(
     [
         new("sync", CronExpression.Parse(options.Value.SyncCron), async (sp, athlete, ct) =>
         {
-            var result = await sp.GetRequiredService<SyncService>().SyncAsync(athlete, 3, 7, ct);
+            var result = await sp.GetRequiredService<SyncService>().SyncAsync(athlete, SyncService.ActivityDays, SyncService.MetricDays, ct);
             if (result.Success && result.NewRunIds.Count > 0)
             {
                 await sp.GetRequiredService<AnalysisService>().AnalyzeRunsAsync(athlete, result.NewRunIds, ct);

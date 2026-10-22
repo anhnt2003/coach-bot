@@ -1,5 +1,6 @@
 using System.Globalization;
 using CoachBot.Core.Abstractions;
+using CoachBot.Core.Domain;
 using CoachBot.Core.Services;
 using CoachBot.Infrastructure.Coros;
 using Microsoft.EntityFrameworkCore;
@@ -7,7 +8,7 @@ using Microsoft.EntityFrameworkCore;
 namespace CoachBot.Host;
 
 /// <summary>
-/// `dotnet run -- coros login|discover|status|test-write yyyy-MM-dd`: one-off commands for connecting and verifying
+/// `dotnet run -- coros login|discover|status|sync [full]|test-write yyyy-MM-dd`: one-off commands for connecting and verifying
 /// the real COROS integration from a terminal.
 /// </summary>
 internal static class CorosCli
@@ -30,10 +31,12 @@ internal static class CorosCli
                 return 0;
             case "status":
                 return await StatusAsync(sp, athlete.Id, cts.Token);
+            case "sync":
+                return await SyncAsync(sp, athlete, full: args.ElementAtOrDefault(1) == "full", cts.Token);
             case "test-write" when args.Length > 1 && DateOnly.TryParseExact(args[1], "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out var date):
                 return await TestWriteAsync(sp, athlete.Id, date, cts.Token);
             default:
-                Console.Error.WriteLine("Usage: coros login | coros discover | coros status | coros test-write yyyy-MM-dd");
+                Console.Error.WriteLine("Usage: coros login | coros discover | coros status | coros sync [full] | coros test-write yyyy-MM-dd");
                 return 2;
         }
     }
@@ -67,6 +70,23 @@ internal static class CorosCli
                           $"Workout tools present: create={caps.Tools.Contains("createScheduledWorkout")}, update={caps.Tools.Contains("updateScheduledWorkout")}. " +
                           $"Automatic push enabled: {caps.CanPushWorkouts}.");
         Console.WriteLine("Next: `coros discover` to record real tool outputs, then `coros test-write yyyy-MM-dd`.");
+        return 0;
+    }
+
+    /// <summary>Same as /sync [full] in Telegram: imports activities and daily metrics, then analyzes new runs. Read-only on COROS.</summary>
+    private static async Task<int> SyncAsync(IServiceProvider sp, Athlete athlete, bool full, CancellationToken ct)
+    {
+        var result = full
+            ? await sp.GetRequiredService<SyncService>().SyncAsync(athlete, SyncService.FullActivityDays, SyncService.FullMetricDays, ct)
+            : await sp.GetRequiredService<SyncService>().SyncAsync(athlete, SyncService.ActivityDays, SyncService.MetricDays, ct);
+        if (!result.Success)
+        {
+            Console.Error.WriteLine($"Sync failed: {result.Error}");
+            return 1;
+        }
+
+        await sp.GetRequiredService<AnalysisService>().AnalyzeRunsAsync(athlete, result.NewRunIds, ct);
+        Console.WriteLine($"Imported {result.NewActivities} new activities ({result.NewRunIds.Count} runs) and {result.MetricDays} days of metrics.");
         return 0;
     }
 

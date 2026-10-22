@@ -8,6 +8,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Telegram.Bot;
+using Telegram.Bot.Exceptions;
 using Telegram.Bot.Types;
 
 namespace CoachBot.Infrastructure.Telegram;
@@ -49,7 +50,17 @@ public sealed partial class TelegramUpdateHandler(
         else if (update.CallbackQuery is { Data: { } data, Message: { } source } callback)
         {
             _chatId = source.Chat.Id;
-            await bot.AnswerCallbackQuery(callback.Id, cancellationToken: ct);
+            try
+            {
+                await bot.AnswerCallbackQuery(callback.Id, cancellationToken: ct);
+            }
+            catch (ApiRequestException ex)
+            {
+                // Only stops the button's spinner. A tap made while the bot was offline is too old to answer,
+                // but the action itself must still run.
+                logger.LogDebug("Could not answer callback query: {Message}", ex.Message);
+            }
+
             if (IsAllowed(_chatId))
             {
                 await OnCallbackAsync(data, source.MessageId, ct);
@@ -340,7 +351,9 @@ public sealed partial class TelegramUpdateHandler(
     private async Task SyncAsync(Athlete athlete, bool full, CancellationToken ct)
     {
         var lang = athlete.Language;
-        var result = await sync.SyncAsync(athlete, full ? 56 : 3, full ? 35 : 7, ct);
+        var result = full
+            ? await sync.SyncAsync(athlete, SyncService.FullActivityDays, SyncService.FullMetricDays, ct)
+            : await sync.SyncAsync(athlete, SyncService.ActivityDays, SyncService.MetricDays, ct);
         if (!result.Success)
         {
             await ReplyAsync(fmt.T(lang, "sync.failed", result.Error), ct);

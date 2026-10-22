@@ -26,7 +26,7 @@ COROS calendar, and talks to you through Telegram (English or Vietnamese).
 | Telegram bot (commands, buttons, daily check, weekly report, alerts) | ✅ implemented; needs your bot token for a live run |
 | Supabase schema (migrations, RLS, `coach` schema not exposed by the Data API) | ✅ verified on local Supabase |
 | Mock COROS adapter (4 scenarios) | ✅ default mode |
-| **Real COROS MCP integration** | ⚠️ **partially verified** — see [docs/coros-integration.md](docs/coros-integration.md) |
+| **Real COROS MCP integration** | ✅ login + reading data verified with a real account · ⚠️ pushing workouts not yet verified (off) — see [docs/coros-integration.md](docs/coros-integration.md) |
 | Gemini (plan design, run analysis, triage, reports) | ⚠️ request/response format unit-tested against the documented API; **not yet called with a real key**, so plan-design quality is unproven |
 
 ## Quick start (local, mock data)
@@ -71,6 +71,7 @@ registers itself as an OAuth client and you approve access in the browser:
 dotnet run --project src/CoachBot.Host -- coros login      # opens a COROS approval link, listens on localhost:8080
 dotnet run --project src/CoachBot.Host -- coros discover   # records real tool schemas/outputs to .local/ (gitignored)
 dotnet run --project src/CoachBot.Host -- coros status
+dotnet run --project src/CoachBot.Host -- coros sync full     # imports 8 weeks of runs + 5 weeks of metrics (read-only)
 dotnet run --project src/CoachBot.Host -- coros test-write 2026-11-05   # creates ONE test workout; delete it in the app
 ```
 
