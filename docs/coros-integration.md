@@ -1,9 +1,10 @@
 # COROS integration: verified status and what is still needed
 
 CoachBot uses only the **official COROS MCP server** ([coroslab/COROS-MCP](https://github.com/coroslab/COROS-MCP)).
-No unofficial APIs, scraping or stored COROS passwords. Until the real integration is verified with your account,
-the default is `Coros__Mode=mock`, and all mock data is stored with `source = 'mock'` so it is never confused with
-real data (history queries only read rows from the active source).
+No unofficial APIs, scraping or stored COROS passwords. A connected COROS account is required: there is no mock or
+demo mode: until `/connect` has stored tokens, every command except `/start`, `/help`, `/language` and `/connect`
+only asks you to connect, and all scheduled jobs are skipped. History queries only read rows with `source = 'coros'`, so rows left over from the old mock mode
+(`source = 'mock'`) are ignored.
 
 ## Verified live (2026-10-21, against production COROS endpoints)
 
@@ -47,7 +48,7 @@ watch guide each repeat, but the `course` step schema is part of what `coros dis
 ## Steps to finish the verification
 
 ```bash
-# .env: Coros__Mode=mcp  (and Coros__McpUrl=https://mcpeu.coros.com/mcp etc. if your account is in another region)
+# .env: Coros__McpUrl=https://mcpeu.coros.com/mcp etc. if your account is not in the global region
 dotnet run --project src/CoachBot.Host -- coros login
 dotnet run --project src/CoachBot.Host -- coros discover        # records raw tool output to .local/ (read-only)
 dotnet run --project src/CoachBot.Host -- coros sync full       # imports 8 weeks of data, same as /sync full (read-only)
@@ -60,7 +61,7 @@ with made-up values (`CorosTextTests`).
 
 ## Known COROS MCP limits (from the official docs)
 
-- No webhooks → CoachBot polls every 3 hours (`Jobs__SyncCron`).
+- No webhooks → CoachBot polls every hour (`Jobs__SyncCron`).
 - Writes: running/trail/cycling only; scheduled dates must be today … today+90; plans 4–16 weeks.
 - **No delete or reschedule tools**: CoachBot therefore pushes only a rolling 7-day window (`Coach__PushWindowDays`)
   and asks you to remove/edit items in the app when a pushed workout later becomes a rest day or the plan is replaced.

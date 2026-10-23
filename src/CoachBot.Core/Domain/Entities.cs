@@ -43,6 +43,8 @@ public class CorosConnection
     public string? EncryptedAccessToken { get; set; }
     public string? EncryptedRefreshToken { get; set; }
     public DateTimeOffset? AccessTokenExpiresAt { get; set; }
+    /// <summary>Tokens are stored; false before /connect, after /disconnect and once COROS rejects the refresh token.</summary>
+    public bool IsConnected => EncryptedAccessToken is not null || EncryptedRefreshToken is not null;
     public string? Scopes { get; set; }
     /// <summary>JSON array of tool names returned by tools/list at the last verification.</summary>
     public string? CapabilitiesJson { get; set; }

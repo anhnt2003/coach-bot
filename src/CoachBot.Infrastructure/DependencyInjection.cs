@@ -53,7 +53,7 @@ public static class DependencyInjection
         services.AddScoped<CoachLlm>();
         services.AddSingleton<MessageFormatter>();
 
-        AddCoros(services, config);
+        AddCoros(services);
         AddLlm(services, config);
         services.AddSingleton<ITextCatalog>(sp => new JsonTextCatalog(sp.GetService<Microsoft.Extensions.Logging.ILogger<JsonTextCatalog>>()));
 
@@ -102,7 +102,7 @@ public static class DependencyInjection
         });
     }
 
-    private static void AddCoros(IServiceCollection services, IConfiguration config)
+    private static void AddCoros(IServiceCollection services)
     {
         services.AddSingleton<TokenCipher>();
         services.AddSingleton<PendingBrowserLogins>();
@@ -112,13 +112,8 @@ public static class DependencyInjection
         services.AddScoped<CorosMcpSession>();
         services.AddScoped<CorosConnectService>();
         services.AddScoped<CorosDiscovery>();
-        services.AddScoped<MockCorosGateway>();
         services.AddScoped<CorosMcpGateway>();
-
-        var mode = config.GetSection(CorosOptions.Section)["Mode"] ?? "mock";
-        services.AddScoped<ICorosGateway>(sp => mode == "mcp"
-            ? sp.GetRequiredService<CorosMcpGateway>()
-            : sp.GetRequiredService<MockCorosGateway>());
+        services.AddScoped<ICorosGateway>(sp => sp.GetRequiredService<CorosMcpGateway>());
     }
 
     private static void TryAddTimeProvider(this IServiceCollection services)

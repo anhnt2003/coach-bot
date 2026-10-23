@@ -1,6 +1,7 @@
 using CoachBot.Core.Abstractions;
 using CoachBot.Core.Domain;
 using CoachBot.Core.Services;
+using CoachBot.Infrastructure.Coros;
 using CoachBot.Infrastructure.Llm;
 using Cronos;
 using Microsoft.EntityFrameworkCore;
@@ -16,7 +17,7 @@ public sealed class JobsOptions
     public const string Section = "Jobs";
 
     public bool Enabled { get; set; } = true;
-    public string SyncCron { get; set; } = "0 */3 * * *";
+    public string SyncCron { get; set; } = "0 * * * *";
     public string DailyCheckCron { get; set; } = "30 6 * * *";
     public string WeeklyReportCron { get; set; } = "0 19 * * 0";
     public string PushCron { get; set; } = "0 20 * * *";
@@ -151,6 +152,12 @@ public sealed class CronJobService(
         if (athlete is null)
         {
             logger.LogDebug("Job {Job} skipped: no athlete yet (send /start)", job.Name);
+            return;
+        }
+
+        if (!await sp.GetRequiredService<CorosConnectService>().IsConnectedAsync(athlete.Id, ct))
+        {
+            logger.LogDebug("Job {Job} skipped: COROS not connected (/connect)", job.Name);
             return;
         }
 
