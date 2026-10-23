@@ -6,6 +6,8 @@ using CoachBot.Core.Abstractions;
 using CoachBot.Infrastructure.Coros;
 using CoachBot.Infrastructure.Llm;
 using CoachBot.Infrastructure.Localization;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using Microsoft.Extensions.Time.Testing;
@@ -281,6 +283,83 @@ public class GeminiClientTests
     {
         var client = new GeminiLlmClient(new HttpClient(), Options.Create(new LlmOptions { ApiKey = "" }), NullLogger<GeminiLlmClient>.Instance);
         Assert.False(client.IsEnabled);
+    }
+}
+
+public class OpenAiCompatibleClientTests
+{
+    private const string Schema = """{"type":"object","properties":{"summary":{"type":"string"}},"required":["summary"]}""";
+
+    private static OpenAiCompatibleLlmClient Client(StubHandler handler) =>
+        new(new HttpClient(handler), Options.Create(new LlmOptions { Provider = "openai_compatible", ApiKey = "sk-1", Model = "grok-4.7", BaseUrl = "https://llm.example/v1/" }),
+            NullLogger<OpenAiCompatibleLlmClient>.Instance);
+
+    private static HttpResponseMessage Stream(string events) =>
+        new(HttpStatusCode.OK) { Content = new StringContent(events, Encoding.UTF8, "text/event-stream") };
+
+    [Fact]
+    public async Task Streams_the_answer_and_joins_the_content_deltas()
+    {
+        var handler = new StubHandler(_ => Stream("""
+            : keep-alive
+
+            data: {"choices":[{"index":0,"delta":{"role":"assistant","content":""}}]}
+
+            data: {"choices":[{"index":0,"delta":{"content":"{\"summary\":"}}]}
+
+            data: {"choices":[{"index":0,"delta":{"content":"\"ok\"}"},"finish_reason":"stop"}]}
+
+            data: [DONE]
+
+            """));
+
+        var json = await Client(handler).GenerateJsonAsync(new LlmRequest("test", "sys", "user", Schema), CancellationToken.None);
+
+        Assert.Equal("""{"summary":"ok"}""", json);
+        var (request, body) = handler.Requests.Single();
+        Assert.Equal("https://llm.example/v1/chat/completions", request.RequestUri!.ToString());
+        Assert.Equal("Bearer sk-1", request.Headers.Authorization!.ToString());
+        using var doc = JsonDocument.Parse(body!);
+        Assert.True(doc.RootElement.GetProperty("stream").GetBoolean());
+        Assert.Equal("json_schema", doc.RootElement.GetProperty("response_format").GetProperty("type").GetString());
+    }
+
+    [Fact]
+    public async Task Reads_a_plain_json_answer_from_a_server_that_does_not_stream()
+    {
+        var handler = new StubHandler(_ => StubHandler.Json(HttpStatusCode.OK,
+            """{"choices":[{"message":{"role":"assistant","content":"{\"summary\":\"ok\"}"},"finish_reason":"stop"}]}"""));
+
+        Assert.Equal("""{"summary":"ok"}""", await Client(handler).GenerateJsonAsync(new LlmRequest("t", "s", "u", Schema), CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task Errors_return_null_or_throw_for_the_caller_to_fall_back()
+    {
+        var gatewayTimeout = new StubHandler(_ => new HttpResponseMessage((HttpStatusCode)524) { Content = new StringContent("timeout") });
+        Assert.Null(await Client(gatewayTimeout).GenerateJsonAsync(new LlmRequest("t", "s", "u", Schema), CancellationToken.None));
+
+        var streamError = new StubHandler(_ => Stream("data: {\"error\":{\"message\":\"upstream overloaded\"}}\n\n"));
+        await Assert.ThrowsAsync<HttpRequestException>(() => Client(streamError).GenerateJsonAsync(new LlmRequest("t", "s", "u", Schema), CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task A_gateway_timeout_is_not_retried()
+    {
+        var handler = new StubHandler(_ => new HttpResponseMessage((HttpStatusCode)524) { Content = new StringContent("timeout") });
+        var config = new ConfigurationBuilder().AddInMemoryCollection(new Dictionary<string, string?>
+        {
+            ["ConnectionStrings:Postgres"] = "Host=localhost;Database=x",
+            ["Llm:Provider"] = "openai_compatible",
+            ["Llm:BaseUrl"] = "https://llm.example/v1",
+        }).Build();
+        var services = new ServiceCollection().AddLogging();
+        services.AddCoachBotCore(config);
+        services.AddHttpClient<OpenAiCompatibleLlmClient>().ConfigurePrimaryHttpMessageHandler(() => handler);
+        await using var sp = services.BuildServiceProvider();
+
+        Assert.Null(await sp.GetRequiredService<OpenAiCompatibleLlmClient>().GenerateJsonAsync(new LlmRequest("t", "s", "u", Schema), CancellationToken.None));
+        Assert.Single(handler.Requests);
     }
 }
 

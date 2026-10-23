@@ -76,7 +76,7 @@ public sealed class PlanService(
             var notes = await db.Feedback.Where(f => f.AthleteId == athlete.Id && f.Notes != null && f.CreatedAt >= notesSince)
                 .OrderByDescending(f => f.CreatedAt).Select(f => f.Notes!).Take(10).ToListAsync(ct);
             assessment = await AssessAsync(athlete, goal, history, zones.Zones, draft, notes, warnings, ct);
-            var designed = await DesignWithLlmAsync(athlete, goal, history, zones.Zones, draft, constraints, validator, options, assessment, notes, warnings, ct);
+            var (designed, fallbackReason) = await DesignWithLlmAsync(athlete, goal, history, zones.Zones, draft, constraints, validator, options, assessment, notes, warnings, ct);
             if (designed is not null)
             {
                 (workouts, rationale, focus) = (designed.Workouts, designed.Rationale, designed.Focus);
@@ -85,7 +85,7 @@ public sealed class PlanService(
             }
             else
             {
-                warnings.Add("plan.llm_rejected");
+                warnings.Add(fallbackReason!);
                 var explained = await ExplainRulePlanAsync(goal, history, zones.Zones, draft, warnings, lang, ct);
                 (rationale, focus) = (explained?.Rationale, explained?.WeeklyFocus);
             }
@@ -152,9 +152,10 @@ public sealed class PlanService(
     /// Asks the LLM to design the plan, using the rule-based draft as a safe reference. Only the validator's enforced
     /// limits (data integrity, injury ceilings) can stop a design; guidelines it goes beyond become warnings. On enforced
     /// violations the LLM gets one chance to repair it, and whatever still breaks a limit after that is clamped week by
-    /// week. Returns null when no design was produced or it could not be clamped (the caller keeps the rule-based plan).
+    /// week. Without a design the caller keeps the rule-based plan and shows the reason: "plan.llm_unavailable" (no usable
+    /// answer: timeout, provider error, malformed output) or "plan.llm_rejected" (the design could not be clamped).
     /// </summary>
-    private async Task<DesignedPlan?> DesignWithLlmAsync(
+    private async Task<(DesignedPlan? Plan, string? FallbackReason)> DesignWithLlmAsync(
         Athlete athlete, RaceGoal goal, History history, TrainingZones zones, PlanDraft draft, PlanConstraints constraints,
         PlanValidator validator, SafetyOptions o, AthleteAssessment? assessment, IReadOnlyList<string> notes, IReadOnlyList<string> warnings,
         CancellationToken ct)
@@ -236,7 +237,7 @@ public sealed class PlanService(
         var design = await llm.AskAsync<PlanDesign>("plan_design", context, athlete.Language, LlmSchemas.PlanDesign, ct);
         if (design is null)
         {
-            return null;
+            return (null, "plan.llm_unavailable");
         }
 
         (List<PlannedWorkout> Workouts, List<Violation> Errors, List<Violation> Violations) Check(PlanDesign d)
@@ -273,7 +274,7 @@ public sealed class PlanService(
             if (result is null)
             {
                 logger.LogWarning("LLM plan design could not be clamped to the limits: {Violations}", Describe(violations.Where(v => !v.IsGuideline)));
-                return null;
+                return (null, "plan.llm_rejected");
             }
 
             (workouts, clamped, replaced) = (result.Workouts, result.ClampedWeeks, result.ReplacedWeeks);
@@ -302,7 +303,7 @@ public sealed class PlanService(
             .Where(w => !string.IsNullOrWhiteSpace(w.Focus) && !replaced.Contains(w.Week - 1))
             .Select(w => new WeeklyFocus(w.Week, w.Focus!))
             .ToList();
-        return new DesignedPlan(workouts, design.Rationale, focus, added);
+        return (new DesignedPlan(workouts, design.Rationale, focus, added), null);
     }
 
     private static string Cap(IntensityCap cap) => $"<= {cap.Share:P0} of the week's km per session (at least {cap.FloorKm} km allowed, never more than {cap.MaxKm} km)";

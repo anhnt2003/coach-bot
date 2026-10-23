@@ -193,6 +193,7 @@
   "alert.sync_failing": "⚠️ COROS sync has failed {0} times in a row. Recovery decisions are on hold until data flows again (/status for details).",
   "plan.designed_by_llm": "🤖 Diagnosed and designed by the AI coach for your goal (workouts tailored to your limiters), kept within the safety limits.",
   "plan.designed_by_rules": "📐 Built by the safety rules.",
+  "plan.llm_unavailable": "The AI coach did not return a usable answer this time (timeout or connection error), so this plan uses the rule-based version. Try /plan again in a few minutes.",
   "plan.llm_rejected": "The AI coach's version could not be brought within the safety limits, so this plan uses the rule-based version.",
   "plan.llm_clamped": "Some weeks of the AI coach's design grew volume or the long run faster than the safety limits allow, so they were cut down to the limit; the rest of the design is unchanged.",
   "plan.llm_weeks_replaced": "Some weeks of the AI coach's design had errors that could not be fixed and were replaced by the safe rule-based week.",

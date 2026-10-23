@@ -193,6 +193,7 @@
   "alert.sync_failing": "⚠️ Đồng bộ COROS đã lỗi {0} lần liên tiếp. Các quyết định về hồi phục tạm dừng cho đến khi có dữ liệu lại (/status để xem chi tiết).",
   "plan.designed_by_llm": "🤖 Do AI coach chẩn đoán và thiết kế theo mục tiêu của bạn (bài tập nhắm vào điểm cần phát triển), nằm trong các giới hạn an toàn.",
   "plan.designed_by_rules": "📐 Được lập bởi bộ quy tắc an toàn.",
+  "plan.llm_unavailable": "Lần này AI coach không trả về kết quả dùng được (quá thời gian chờ hoặc lỗi kết nối), nên giáo án này tạm dùng bản do quy tắc lập. Bạn thử lại /plan sau ít phút nhé.",
   "plan.llm_rejected": "Không đưa được phiên bản của AI coach về trong giới hạn an toàn nên giáo án này dùng bản do quy tắc lập.",
   "plan.llm_clamped": "Một vài tuần trong thiết kế của AI coach tăng khối lượng hoặc long run nhanh hơn giới hạn an toàn nên đã được giảm xuống mức trần; phần còn lại giữ nguyên.",
   "plan.llm_weeks_replaced": "Một vài tuần trong thiết kế của AI coach có lỗi không sửa được nên đã được thay bằng tuần an toàn do quy tắc lập.",

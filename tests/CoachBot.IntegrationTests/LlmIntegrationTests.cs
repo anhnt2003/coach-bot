@@ -108,6 +108,21 @@ public class LlmIntegrationTests(PostgresFixture pg)
         Assert.Equal(athlete.RunDaysPerWeek, context["athlete"]!["run_days_per_week"]!.GetValue<int>());
     }
 
+    [Fact]
+    public async Task No_answer_from_the_llm_keeps_the_rule_based_plan_and_says_why()
+    {
+        var llm = new ScriptedLlm((_, _) => null);
+        var (sp, scope, athlete) = await SetupAsync(llm);
+        await using var _ = sp;
+        await using var __ = scope;
+
+        var result = await scope.ServiceProvider.GetRequiredService<PlanService>().GenerateAsync(athlete, default);
+
+        Assert.Equal("rules", result.Plan!.GeneratedBy);
+        Assert.Contains("plan.llm_unavailable", result.Warnings);
+        Assert.DoesNotContain("plan.llm_rejected", result.Warnings);
+    }
+
     private const string Assessment = """
         {"level":"intermediate","summary":"Consistent 35 km weeks; threshold work is missing.","goal_verdict":"ambitious",
          "goal_comment":"1:50 needs about 3% more speed.","strengths":["consistent easy running"],
