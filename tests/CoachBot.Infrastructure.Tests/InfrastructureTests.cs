@@ -233,52 +233,55 @@ public class CorosOAuthClientTests
     }
 }
 
-public class GeminiClientTests
+public class OpenAiCompatibleClientTests
 {
     private const string Schema = """{"type":"object","properties":{"summary":{"type":"string"}},"required":["summary"]}""";
 
+    private static OpenAiCompatibleLlmClient Client(StubHandler handler, string? baseUrl = "https://llm.example/v1/", string model = "m-1", string? apiKey = "k-123") =>
+        new(new HttpClient(handler), Options.Create(new LlmOptions { Provider = "openai_compatible", BaseUrl = baseUrl, Model = model, ApiKey = apiKey }),
+            NullLogger<OpenAiCompatibleLlmClient>.Instance);
+
     [Fact]
-    public async Task Sends_schema_constrained_request_with_key_in_header_only()
+    public async Task Sends_schema_constrained_chat_completion_with_bearer_key()
     {
         var handler = new StubHandler(_ => StubHandler.Json(HttpStatusCode.OK,
-            """{"candidates":[{"content":{"parts":[{"text":"{\"summary\":\"ok\"}"}]},"finishReason":"STOP"}],"usageMetadata":{"totalTokenCount":10}}"""));
-        var client = new GeminiLlmClient(new HttpClient(handler), Options.Create(new LlmOptions { Provider = "gemini", ApiKey = "k-123", Model = "gemini-flash-latest" }),
-            NullLogger<GeminiLlmClient>.Instance);
+            """{"choices":[{"message":{"role":"assistant","content":"{\"summary\":\"ok\"}"}}]}"""));
 
-        var json = await client.GenerateJsonAsync(new LlmRequest("test", "sys", "user", Schema), CancellationToken.None);
+        var json = await Client(handler).GenerateJsonAsync(new LlmRequest("test", "sys", "user", Schema), CancellationToken.None);
 
         Assert.Equal("""{"summary":"ok"}""", json);
         var (request, body) = handler.Requests.Single();
-        Assert.Equal("https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent", request.RequestUri!.ToString());
-        Assert.DoesNotContain("k-123", request.RequestUri!.ToString(), StringComparison.Ordinal);
-        Assert.Equal("k-123", request.Headers.GetValues("x-goog-api-key").Single());
+        Assert.Equal("https://llm.example/v1/chat/completions", request.RequestUri!.ToString());
+        Assert.Equal("Bearer k-123", request.Headers.Authorization!.ToString());
         using var doc = JsonDocument.Parse(body!);
-        var config = doc.RootElement.GetProperty("generationConfig");
-        Assert.Equal("application/json", config.GetProperty("responseMimeType").GetString());
-        Assert.Equal("object", config.GetProperty("responseJsonSchema").GetProperty("type").GetString());
+        Assert.Equal("m-1", doc.RootElement.GetProperty("model").GetString());
+        var format = doc.RootElement.GetProperty("response_format");
+        Assert.Equal("json_schema", format.GetProperty("type").GetString());
+        Assert.Equal("object", format.GetProperty("json_schema").GetProperty("schema").GetProperty("type").GetString());
     }
 
     [Fact]
-    public async Task Errors_and_empty_candidates_return_null()
+    public async Task Omits_authorization_without_api_key()
     {
-        foreach (var response in new[]
-                 {
-                     StubHandler.Json(HttpStatusCode.TooManyRequests, """{"error":{"message":"quota"}}"""),
-                     StubHandler.Json(HttpStatusCode.OK, """{"promptFeedback":{"blockReason":"SAFETY"}}"""),
-                 })
-        {
-            var client = new GeminiLlmClient(new HttpClient(new StubHandler(_ => response)),
-                Options.Create(new LlmOptions { ApiKey = "k" }), NullLogger<GeminiLlmClient>.Instance);
-            Assert.Null(await client.GenerateJsonAsync(new LlmRequest("t", "s", "u", Schema), CancellationToken.None));
-        }
+        var handler = new StubHandler(_ => StubHandler.Json(HttpStatusCode.OK, """{"choices":[{"message":{"content":"{}"}}]}"""));
+
+        await Client(handler, apiKey: null).GenerateJsonAsync(new LlmRequest("t", "s", "u", Schema), CancellationToken.None);
+
+        Assert.Null(handler.Requests.Single().Request.Headers.Authorization);
     }
 
     [Fact]
-    public void Disabled_without_api_key()
+    public async Task Errors_return_null()
     {
-        var client = new GeminiLlmClient(new HttpClient(), Options.Create(new LlmOptions { ApiKey = "" }), NullLogger<GeminiLlmClient>.Instance);
-        Assert.False(client.IsEnabled);
+        var handler = new StubHandler(_ => StubHandler.Json(HttpStatusCode.TooManyRequests, """{"error":{"message":"quota"}}"""));
+        Assert.Null(await Client(handler).GenerateJsonAsync(new LlmRequest("t", "s", "u", Schema), CancellationToken.None));
     }
+
+    [Theory]
+    [InlineData(null, "m-1")]
+    [InlineData("https://llm.example/v1", "")]
+    public void Disabled_without_base_url_or_model(string? baseUrl, string model) =>
+        Assert.False(Client(new StubHandler(), baseUrl, model).IsEnabled);
 }
 
 public class PromptLibraryTests

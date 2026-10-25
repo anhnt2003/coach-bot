@@ -90,13 +90,11 @@ public static class DependencyInjection
             o.Retry.MaxRetryAttempts = 2;
         });
 
-        Resilience(services.AddHttpClient<GeminiLlmClient>(c => c.Timeout = Timeout.InfiniteTimeSpan));
         Resilience(services.AddHttpClient<OpenAiCompatibleLlmClient>(c => c.Timeout = Timeout.InfiniteTimeSpan));
 
         var provider = config.GetSection(LlmOptions.Section)["Provider"] ?? "none";
         services.AddTransient<ILlmClient>(sp => provider switch
         {
-            "gemini" => sp.GetRequiredService<GeminiLlmClient>(),
             "openai_compatible" => sp.GetRequiredService<OpenAiCompatibleLlmClient>(),
             _ => new NullLlmClient(),
         });

@@ -190,7 +190,7 @@ public sealed class CronJobService(
     }
 }
 
-/// <summary>Non-fatal startup diagnostics: database reachable, LLM model available.</summary>
+/// <summary>Non-fatal startup diagnostics: database reachable, LLM configured.</summary>
 public sealed class StartupChecks(IServiceScopeFactory scopes, IOptions<LlmOptions> llm, ILogger<StartupChecks> logger) : IHostedService
 {
     public async Task StartAsync(CancellationToken cancellationToken)
@@ -202,19 +202,9 @@ public sealed class StartupChecks(IServiceScopeFactory scopes, IOptions<LlmOptio
             logger.LogError("Database is not reachable; check ConnectionStrings__Postgres");
         }
 
-        if (llm.Value.Provider == "gemini" && !string.IsNullOrWhiteSpace(llm.Value.ApiKey))
+        if (llm.Value.Provider == "openai_compatible" && (string.IsNullOrWhiteSpace(llm.Value.BaseUrl) || string.IsNullOrWhiteSpace(llm.Value.Model)))
         {
-            // Bounded: the client's retry budget would otherwise hold up startup for minutes when Gemini is unreachable.
-            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-            timeout.CancelAfter(TimeSpan.FromSeconds(20));
-            try
-            {
-                await scope.ServiceProvider.GetRequiredService<GeminiLlmClient>().VerifyModelAsync(timeout.Token);
-            }
-            catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
-            {
-                logger.LogWarning(ex, "Could not verify the Gemini model at startup; LLM calls may fail");
-            }
+            logger.LogError("Llm__Provider=openai_compatible needs Llm__BaseUrl and Llm__Model; analysis and reports use rule-based templates");
         }
         else if (llm.Value.Provider == "none")
         {
