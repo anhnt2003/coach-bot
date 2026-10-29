@@ -162,7 +162,7 @@ public static class TestHost
         services.Replace(ServiceDescriptor.Singleton<INotifier>(notifier));
         services.Replace(ServiceDescriptor.Singleton<ITextCatalog>(new JsonTextCatalog(strict: true)));
         services.Replace(ServiceDescriptor.Scoped<ICorosGateway>(_ => new FakeCorosGateway(time, scenario, timeZone)));
-        services.Replace(ServiceDescriptor.Singleton(llm ?? new ScriptedLlm((_, _) => null)));
+        services.Replace(ServiceDescriptor.Singleton<ILlmClient>(llm ?? new ScriptedLlm()));
         FakeCorosGateway.PushedWorkouts.Clear();
         return services.BuildServiceProvider(new ServiceProviderOptions { ValidateScopes = true, ValidateOnBuild = true });
     }

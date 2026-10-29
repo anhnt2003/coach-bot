@@ -22,7 +22,6 @@ public static class DependencyInjection
     public static IServiceCollection AddCoachBotCore(this IServiceCollection services, IConfiguration config)
     {
         services.AddOptions<CoachOptions>().Bind(config.GetSection(CoachOptions.Section)).ValidateDataAnnotations().ValidateOnStart();
-        services.AddOptions<SafetyOptions>().Bind(config.GetSection(SafetyOptions.Section));
         services.AddOptions<CorosOptions>().Bind(config.GetSection(CorosOptions.Section)).ValidateDataAnnotations().ValidateOnStart();
         services.AddOptions<SecretsOptions>().Bind(config.GetSection(SecretsOptions.Section)).ValidateDataAnnotations().ValidateOnStart();
 

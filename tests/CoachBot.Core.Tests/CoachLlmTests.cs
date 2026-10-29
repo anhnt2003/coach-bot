@@ -82,6 +82,19 @@ public class CoachLlmTests
     }
 
     [Fact]
+    public void Every_schema_is_valid_json()
+    {
+        var schemas = typeof(LlmSchemas).GetFields(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static)
+            .Where(f => f.IsLiteral).ToList();
+        Assert.True(schemas.Count >= 6);
+        foreach (var field in schemas)
+        {
+            using var doc = System.Text.Json.JsonDocument.Parse((string)field.GetRawConstantValue()!);
+            Assert.Equal("object", doc.RootElement.GetProperty("type").GetString());
+        }
+    }
+
+    [Fact]
     public async Task Client_failures_are_recorded_and_rethrown()
     {
         var (llm, log) = Create(() => throw new LlmException("weekly_report", LlmFailure.Http, "HTTP 502"));

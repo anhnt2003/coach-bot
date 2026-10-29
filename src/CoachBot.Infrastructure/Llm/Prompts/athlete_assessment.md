@@ -1,24 +1,18 @@
-Assess this athlete as their coach before a training plan is designed: where they stand today relative to their goal race, and what most limits their performance at that distance.
+Assess this athlete as their coach before you design their training plan: where they stand today relative to their goal race, and what most limits their performance at that distance.
 
-Think like a coach reading a training log:
-- Volume and consistency: weekly km over the last 8 weeks (gaps, spikes, trend), weeks of history.
-- Endurance: the longest recent run compared with what the goal distance needs.
-- Intensity profile: recent paces and heart rates; are easy runs really easy, are there any faster sessions, how does threshold pace compare with the goal pace?
-- Goal realism: compare goal_time_seconds with predicted_time_seconds_from_current_fitness (the application's conservative estimate) and with the weeks available. Realistic = within about 3%, ambitious = 3–8% faster, unrealistic = more than 8% faster or too little time. Use "no_goal_time" when no goal time is set.
-- Risks: sudden volume jumps, little history, notes about pain, poor sleep or stress, age.
-
-What the distances demand:
-- Marathon: aerobic base and long-run endurance (long runs towards 30–32 km), fuelling, marathon-pace durability; threshold supports it.
-- Half marathon: threshold endurance (sustained running near half-marathon pace), long runs of 18–22 km, some VO2max work.
-- 10K: VO2max and threshold, with enough aerobic base; 10K-pace specificity late in the plan.
-- 5K: VO2max and speed (repetition pace, strides, hills) on top of a solid aerobic base.
+The data:
+- "race": name, date, distance_km, goal_time_seconds (null when the athlete set none) and weeks_to_race.
+- "athlete": run days per week, age, max heart rate, profile notes and recent notes (newest first).
+- "fitness": weekly km for the last 8 weeks (oldest first), the 4-week average, the longest run of the last 4 weeks, weeks of history, up to 20 recent runs (date, km, minutes, average pace, average heart rate, name), and the latest COROS fitness values (threshold pace in seconds per km, marathon prediction in seconds, VO2max) with their date. Any of these can be missing.
 
 Write:
-- "level", "summary" (2–4 sentences), "goal_verdict" and "goal_comment".
+- "level", "summary" (2–4 sentences).
+- "predicted_race_seconds": your prediction of the goal race time from the athlete's current fitness, or 0 when the data is too thin to predict.
+- "goal_verdict" (use "no_goal_time" when no goal time is set) and "goal_comment" (the goal compared with your prediction and the weeks available).
 - "strengths": what the data shows they already do well (may be empty).
 - "limiters": at most 3, most important first, each with the evidence from the data.
 - "risks": what the plan must be careful about (may be empty).
-- "priorities": one entry per phase (base, build, peak, taper) saying what to develop and with which kinds of sessions, tailored to this athlete and distance.
+- "priorities": one entry per phase (base, build, peak, taper) saying what to develop and with which kinds of sessions.
 Be honest: if the data is too thin to judge something, say so instead of guessing.
 
 Data (JSON):

@@ -1,6 +1,5 @@
 using System.Text;
 using CoachBot.Core.Abstractions;
-using CoachBot.Core.Analysis;
 using CoachBot.Core.Domain;
 using CoachBot.Core.Planning;
 using Microsoft.EntityFrameworkCore;
@@ -8,10 +7,14 @@ using Microsoft.Extensions.Logging;
 
 namespace CoachBot.Core.Services;
 
-/// <summary>Post-run pipeline: match → compliance → readiness → adaptation (rules + validated LLM suggestions) → message.</summary>
+/// <summary>
+/// After each run the LLM decides which planned session it was, how it went, how ready the athlete is, and how the
+/// coming sessions should change. Code gathers the data, checks the answer can be stored, and writes it.
+/// </summary>
 public sealed class AnalysisService(
     ICoachDb db,
     PlanService plans,
+    AthleteService athletes,
     ReadinessService readiness,
     RecommendationService recommendations,
     ICorosGateway gateway,
@@ -63,6 +66,10 @@ public sealed class AnalysisService(
         return analyzed;
     }
 
+    /// <summary>
+    /// Analyzes one run. Nothing is written until the LLM's answer passed the integrity gate, so when it fails
+    /// (<see cref="LlmException"/>) the run stays unanalyzed and the next sync retries it.
+    /// </summary>
     public async Task<RunAnalysis?> AnalyzeRunAsync(Athlete athlete, Activity activity, CancellationToken ct)
     {
         if (await db.RunAnalyses.AnyAsync(r => r.ActivityId == activity.Id, ct))
@@ -74,8 +81,87 @@ public sealed class AnalysisService(
         var today = AthleteClock.Today(time, athlete.TimeZone);
         var runDate = AthleteClock.LocalDate(activity.StartTime, athlete.TimeZone);
         var plan = await plans.GetCurrentPlanAsync(athlete.Id, ct);
+        var goal = await athletes.GetActiveGoalAsync(athlete.Id, ct);
+        var snapshot = plan is null ? null : PlanSnapshot.Of(plan);
+        var paces = plan is null ? PaceTable.Empty(goal?.DistanceKm ?? RaceProfiles.MarathonKm) : PlanSnapshot.PacesOf(plan);
+        var recovery = await readiness.LoadContextAsync(athlete, today, ct);
 
-        var matched = plan is null ? null : WorkoutMatcher.Match(runDate, activity.DistanceKm, plan.Workouts);
+        var window = plan?.Workouts.Where(w => w.Date >= runDate.AddDays(-3) && w.Date <= runDate.AddDays(7)).OrderBy(w => w.Date).ToList() ?? [];
+        var matchable = window.Where(w => w.Status == WorkoutStatus.Planned && w.Type != WorkoutType.Rest).Select(w => w.Id).ToHashSet();
+
+        // Backfilled older runs are analyzed, but only a run from today or yesterday changes the plan and gets a message.
+        var isRecent = runDate >= today.AddDays(-1);
+        var canAdapt = isRecent && plan?.Status == PlanStatus.Active;
+        var offered = canAdapt
+            ? window.Where(w => w.Status == WorkoutStatus.Planned && w.Type != WorkoutType.Race && w.Date >= today).Select(w => w.Id).ToHashSet()
+            : [];
+        var raceDate = goal?.RaceDate ?? plan?.EndDate ?? today;
+
+        var ai = await llm.AskAsync<RunAnalysisResponse>("run_analysis", athlete.Id, new
+        {
+            today,
+            run = new
+            {
+                date = runDate,
+                km = Math.Round(activity.DistanceKm, 2),
+                duration_min = activity.DurationSeconds / 60,
+                pace = MessageFormatter.Pace(activity.AvgPaceSecPerKm),
+                avg_hr = activity.AvgHr,
+                max_hr = activity.MaxHr,
+                training_load = activity.TrainingLoad,
+                activity.Name,
+            },
+            goal = LlmContext.Goal(goal),
+            diagnosis = snapshot?.Assessment is { } a ? new { a.Level, a.Limiters, a.Priorities, a.Risks } : null,
+            plan = plan is null ? null : new { status = plan.Status, paces = paces.Entries, sessions = window.Select(LlmContext.Session) },
+            changes_allowed = canAdapt,
+            daily_metrics = recovery.DailyMetrics,
+            runs = recovery.Runs,
+            feedback = recovery.Feedback,
+            recent_readiness = recovery.RecentReadiness,
+            athlete_notes = athlete.Notes,
+        }, lang, LlmSchemas.RunAnalysis, ct, answer =>
+        {
+            var errors = new List<string>();
+            if (string.IsNullOrWhiteSpace(answer.Summary))
+            {
+                errors.Add("summary_missing");
+            }
+
+            LlmGates.Readiness(answer.Readiness, errors);
+            if (!LlmGates.PaceStatuses.Contains(answer.PaceStatus))
+            {
+                errors.Add($"pace_status_invalid: {answer.PaceStatus ?? "null"}");
+            }
+
+            if (!LlmGates.HrStatuses.Contains(answer.HrStatus))
+            {
+                errors.Add($"hr_status_invalid: {answer.HrStatus ?? "null"}");
+            }
+
+            var matched = MatchedId(answer);
+            if (!string.IsNullOrWhiteSpace(answer.MatchedWorkoutId) && (matched is null || !matchable.Contains(matched.Value)))
+            {
+                errors.Add($"matched_workout_unknown: {answer.MatchedWorkoutId} is not a planned session you were given");
+            }
+
+            if (canAdapt)
+            {
+                // The session this run fulfilled is done; it cannot also be changed.
+                var changeable = offered.Where(id => id != matched).ToHashSet();
+                errors.AddRange(WorkoutChangeMapper.Map(answer.Changes, plan!, changeable, paces, today, raceDate).Errors);
+            }
+
+            return errors;
+        });
+
+        var (level, confidence) = LlmGates.Readiness(ai.Readiness, []);
+        var readinessSummary = ai.Readiness!.Summary!.Trim();
+        var concerns = Clean(ai.Readiness.Concerns);
+        var symptomConcerns = Clean(ai.SymptomConcerns);
+        var changes = canAdapt ? WorkoutChangeMapper.Map(ai.Changes, plan!, offered, paces, today, raceDate).Changes : [];
+
+        var matched = MatchedId(ai) is Guid id ? plan!.Workouts.First(w => w.Id == id) : null;
         if (matched is not null)
         {
             matched.Status = WorkoutStatus.Completed;
@@ -83,100 +169,62 @@ public sealed class AnalysisService(
             matched.UpdatedAt = time.GetUtcNow();
         }
 
-        var compliance = RunAnalyzer.Analyze(activity, matched);
-        var state = await readiness.EvaluateAsync(athlete, today, ct);
-
-        // Backfilled older runs are recorded but do not trigger adaptations or messages.
-        var isRecent = runDate >= today.AddDays(-1);
-        var canAdapt = isRecent && plan?.Status == PlanStatus.Active;
-
-        var proposal = AdaptationProposal.None;
-        if (canAdapt)
-        {
-            var snapshot = CoachJson.Deserialize<PlanSnapshot>(plan!.InputsJson);
-            int? planThreshold = snapshot?.Zones.Basis == ZoneBasis.CorosThreshold ? snapshot.Zones.ThresholdPaceSecPerKm : null;
-            var thresholdSince = today.AddDays(-14);
-            var currentThreshold = await db.DailyMetrics
-                .Where(m => m.AthleteId == athlete.Id && m.Source == gateway.Source && m.Date >= thresholdSince && m.ThresholdPaceSecPerKm != null)
-                .OrderByDescending(m => m.Date).Select(m => m.ThresholdPaceSecPerKm).FirstOrDefaultAsync(ct);
-            proposal = AdaptationEngine.Propose(new AdaptationContext(
-                today, state.Today, state.Previous, plan.Workouts, planThreshold is null ? null : currentThreshold, planThreshold));
-        }
-
-        RunAnalysisResponse? ai = null;
-        if (isRecent)
-        {
-            var latestNotes = await db.Feedback.Where(f => f.AthleteId == athlete.Id && f.Notes != null)
-                .OrderByDescending(f => f.CreatedAt).Select(f => f.Notes).FirstOrDefaultAsync(ct);
-            var planInputs = plan is null ? null : CoachJson.Deserialize<PlanSnapshot>(plan.InputsJson);
-            ai = await llm.AskOrNullAsync<RunAnalysisResponse>("run_analysis", athlete.Id, new
-            {
-                goal_distance_km = planInputs?.Zones.RaceKm,
-                diagnosis = planInputs?.Assessment is { } a ? new { a.Level, a.Limiters, a.Priorities } : null,
-                run = new { date = runDate, km = Math.Round(activity.DistanceKm, 2), duration_min = activity.DurationSeconds / 60, pace = MessageFormatter.Pace(activity.AvgPaceSecPerKm), activity.AvgHr, activity.MaxHr, activity.TrainingLoad },
-                planned = matched is null ? null : new { matched.Type, matched.Title, structure = matched.Description, km = matched.TargetDistanceKm, pace = new[] { MessageFormatter.Pace(matched.PaceMinSecPerKm), MessageFormatter.Pace(matched.PaceMaxSecPerKm) }, hr = new[] { matched.HrMin, matched.HrMax } },
-                compliance,
-                readiness = new { state.Today.Level, state.Today.Confidence, state.Today.Signals, state.Today.Missing, previous_days = state.Previous },
-                rule_based_changes = proposal.Changes,
-                upcoming = plan?.Workouts.Where(w => w.Status == WorkoutStatus.Planned && w.Date >= today && w.Date <= today.AddDays(7))
-                    .OrderBy(w => w.Date).Select(w => new { workout_id = w.Id, w.Date, w.Type, w.Title, km = w.TargetDistanceKm, w.Phase }),
-                athlete_notes = latestNotes,
-            }, lang, LlmSchemas.RunAnalysis, ct);
-        }
-
         var analysis = new RunAnalysis
         {
             AthleteId = athlete.Id,
             ActivityId = activity.Id,
             PlannedWorkoutId = matched?.Id,
-            DistanceRatio = compliance.DistanceRatio,
-            PaceStatus = compliance.PaceStatus,
-            HrStatus = compliance.HrStatus,
-            Readiness = state.Today.Level,
-            ReadinessConfidence = state.Today.Confidence,
-            DetailsJson = CoachJson.Serialize(new { compliance.Flags, state.Today.Signals, state.Today.Missing, rule_reason = proposal.ReasonKey }),
-            Narrative = ai?.Summary,
+            DistanceRatio = matched is { TargetDistanceKm: > 0 } ? Math.Round(activity.DistanceKm / matched.TargetDistanceKm, 2) : null,
+            PaceStatus = ai.PaceStatus!,
+            HrStatus = ai.HrStatus!,
+            Readiness = level,
+            ReadinessConfidence = confidence,
+            DetailsJson = CoachJson.Serialize(new { readiness_summary = readinessSummary, readiness_concerns = concerns, symptom_concerns = symptomConcerns }),
+            Narrative = ai.Summary!.Trim(),
             CreatedAt = time.GetUtcNow(),
         };
         db.RunAnalyses.Add(analysis);
+        if (isRecent)
+        {
+            await readiness.UpsertAsync(athlete.Id, today, level, confidence, readinessSummary, concerns, "run_analysis", ct);
+        }
+
         await db.SaveChangesAsync(ct);
 
-        IReadOnlyList<Recommendation> recs = [];
-        var llmChanges = ParseSuggestions(ai);
-        if (canAdapt && (proposal.Changes.Count > 0 || llmChanges.Count > 0))
+        IReadOnlyList<Recommendation> recs = changes.Count > 0
+            ? await recommendations.CreateAsync(athlete, plan!, changes, "run_analysis", fmt.T(lang, "adapt.from_run"), analysis.Id, ct)
+            : [];
+
+        if (isRecent && level != ReadinessLevel.Green)
         {
-            var reasonKey = proposal.IsEmpty ? "adapt.llm_easing" : proposal.ReasonKey;
-            recs = await recommendations.CreateAsync(athlete, plan!, proposal.Changes, llmChanges, state.Today,
-                proposal.IsEmpty ? "llm_easing" : proposal.ReasonKey, fmt.T(lang, reasonKey), analysis.Id, today, ct);
+            await alerts.RaiseAsync(athlete.Id, AlertType.Fatigue, level == ReadinessLevel.Red ? AlertSeverity.Warning : AlertSeverity.Info,
+                readinessSummary, $"fatigue:{today:yyyy-MM-dd}", ct, send: false);
         }
 
-        if (state.Today.Level != ReadinessLevel.Green)
+        if (symptomConcerns.Count > 0)
         {
-            await alerts.RaiseAsync(athlete.Id, AlertType.Fatigue,
-                state.Today.Level == ReadinessLevel.Red ? AlertSeverity.Warning : AlertSeverity.Info,
-                fmt.T(lang, $"readiness.level.{state.Today.Level.ToString().ToLowerInvariant()}"), $"fatigue:{today}", ct, send: false);
-        }
-
-        var concerns = ai?.SymptomConcerns?.Where(c => !string.IsNullOrWhiteSpace(c)).ToList() ?? [];
-        if (concerns.Count > 0)
-        {
-            // Notes are triaged (and can pause the plan) when the athlete sends them. Here the LLM only re-reads older
-            // notes, so it raises a concern and asks the athlete to report via /symptom instead of pausing again.
-            await alerts.RaiseAsync(athlete.Id, AlertType.Symptom, AlertSeverity.Warning, string.Join("; ", concerns),
+            // Notes are triaged (and can pause the plan) when the athlete sends them. Here the LLM only re-reads them,
+            // so it raises a concern and asks the athlete to report via /symptom instead of pausing again.
+            await alerts.RaiseAsync(athlete.Id, AlertType.Symptom, AlertSeverity.Warning, string.Join("; ", symptomConcerns),
                 $"llm_symptom:{activity.Id}", ct, send: false);
         }
 
         if (isRecent)
         {
-            await notifier.SendAsync(athlete.Id, Render(athlete, activity, matched, compliance, state, analysis, recs, concerns), ct);
+            await notifier.SendAsync(athlete.Id, Render(athlete, activity, matched, level, confidence, readinessSummary, concerns, analysis, recs, symptomConcerns), ct);
         }
 
+        logger.LogInformation("Run {ActivityId} analyzed: matched {Matched}, readiness {Level}, {Changes} change(s)", activity.Id, matched?.Id, level, changes.Count);
         return analysis;
     }
 
+    private static Guid? MatchedId(RunAnalysisResponse answer) => Guid.TryParse(answer.MatchedWorkoutId, out var id) ? id : null;
+
+    private static List<string> Clean(IReadOnlyList<string>? items) => items?.Where(c => !string.IsNullOrWhiteSpace(c)).Select(c => c.Trim()).ToList() ?? [];
+
     private OutboundMessage Render(
-        Athlete athlete, Activity activity, PlannedWorkout? matched, RunCompliance compliance, ReadinessHistory state,
-        RunAnalysis analysis, IReadOnlyList<Recommendation> recs, IReadOnlyList<string> concerns)
+        Athlete athlete, Activity activity, PlannedWorkout? matched, ReadinessLevel level, Confidence confidence, string readinessSummary,
+        IReadOnlyList<string> concerns, RunAnalysis analysis, IReadOnlyList<Recommendation> recs, IReadOnlyList<string> symptomConcerns)
     {
         var lang = athlete.Language;
         var sb = new StringBuilder();
@@ -184,22 +232,12 @@ public sealed class AnalysisService(
             MessageFormatter.Pace(activity.AvgPaceSecPerKm), activity.AvgHr?.ToString(System.Globalization.CultureInfo.InvariantCulture) ?? "–"));
         sb.AppendLine(matched is null ? fmt.T(lang, "analysis.unplanned") : fmt.T(lang, "analysis.planned", fmt.Line(lang, matched)));
 
-        foreach (var flag in compliance.Flags.Where(f => f != "unplanned_run"))
-        {
-            sb.AppendLine("• " + fmt.T(lang, $"analysis.flag.{flag}"));
-        }
-
         sb.AppendLine();
-        sb.AppendLine(fmt.T(lang, $"readiness.level.{state.Today.Level.ToString().ToLowerInvariant()}")
-                      + " " + fmt.T(lang, $"readiness.confidence.{state.Today.Confidence.ToString().ToLowerInvariant()}"));
-        foreach (var signal in state.Today.Concerns)
+        sb.AppendLine(fmt.ReadinessLine(lang, level, confidence));
+        sb.AppendLine(readinessSummary);
+        foreach (var concern in concerns)
         {
-            sb.AppendLine(fmt.SignalLine(lang, signal));
-        }
-
-        if (state.Today.Missing.Count > 0)
-        {
-            sb.AppendLine(fmt.T(lang, "readiness.missing", string.Join(", ", state.Today.Missing.Select(m => fmt.T(lang, $"readiness.signal.{m}")))));
+            sb.AppendLine("• " + concern);
         }
 
         if (!string.IsNullOrWhiteSpace(analysis.Narrative))
@@ -207,7 +245,7 @@ public sealed class AnalysisService(
             sb.AppendLine().AppendLine(analysis.Narrative);
         }
 
-        if (concerns.Count > 0)
+        if (symptomConcerns.Count > 0)
         {
             sb.AppendLine().AppendLine(fmt.T(lang, "analysis.llm_concern"));
         }
@@ -224,44 +262,5 @@ public sealed class AnalysisService(
         buttons.Add([.. Enumerable.Range(1, 5).Select(i => new MessageButton(i.ToString(System.Globalization.CultureInfo.InvariantCulture), $"rpe:{activity.Id}:{i}"))]);
         buttons.Add([.. Enumerable.Range(6, 5).Select(i => new MessageButton(i.ToString(System.Globalization.CultureInfo.InvariantCulture), $"rpe:{activity.Id}:{i}"))]);
         return new OutboundMessage(sb.ToString().TrimEnd(), buttons);
-    }
-
-    /// <summary>
-    /// Turns the LLM's suggestions into candidate changes. Nothing here is trusted: unknown ids/actions are dropped, and
-    /// AdaptationEngine.MergeLlmProposals rebuilds the "before" state from the database and applies the safety gates.
-    /// </summary>
-    private static List<ProposedChange> ParseSuggestions(RunAnalysisResponse? ai)
-    {
-        var result = new List<ProposedChange>();
-        foreach (var s in ai?.Suggestions ?? [])
-        {
-            if (!Guid.TryParse(s.WorkoutId, out var id))
-            {
-                continue;
-            }
-
-            ChangeAction? action = s.Action switch
-            {
-                "reduce_distance" => ChangeAction.ReduceDistance,
-                "downgrade" => ChangeAction.Downgrade,
-                "convert_to_rest" => ChangeAction.ConvertToRest,
-                "swap_days" => ChangeAction.SwapDays,
-                "increase_distance" => ChangeAction.IncreaseDistance,
-                "upgrade" => ChangeAction.Upgrade,
-                _ => null,
-            };
-            var hasType = Enum.TryParse<WorkoutType>(s.ToType?.Replace("_", "", StringComparison.Ordinal), ignoreCase: true, out var toType);
-            DateOnly? newDate = DateOnly.TryParseExact(s.NewDate, "yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture,
-                System.Globalization.DateTimeStyles.None, out var d) ? d : null;
-            if (action is null || (action is ChangeAction.Upgrade or ChangeAction.Downgrade && !hasType) || (action == ChangeAction.SwapDays && newDate is null))
-            {
-                continue;
-            }
-
-            result.Add(new ProposedChange(id, default, action.Value, WorkoutType.Rest, hasType ? toType : WorkoutType.Easy,
-                0, action == ChangeAction.ConvertToRest ? 0 : Math.Max(0, s.ToKm), newDate));
-        }
-
-        return result;
     }
 }

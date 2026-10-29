@@ -36,16 +36,26 @@ public static class CoachJson
     }
 }
 
-/// <summary>What a plan was generated from; stored in <see cref="TrainingPlan.InputsJson"/>.</summary>
+/// <summary>What a plan was generated from, and the coach's pace table; stored in <see cref="TrainingPlan.InputsJson"/>.</summary>
 public sealed record PlanSnapshot(
-    TrainingZones Zones,
-    PlanBaseline Baseline,
+    PaceTable? Paces,
+    double RaceKm,
     double RecentWeeklyKm,
     double LongestRecentRunKm,
     int WeeksOfHistory,
     double? Vo2Max,
     IReadOnlyList<WeeklyFocus>? WeeklyFocus = null,
-    AthleteAssessment? Assessment = null);
+    AthleteAssessment? Assessment = null)
+{
+    public static PlanSnapshot? Of(TrainingPlan plan) => CoachJson.Deserialize<PlanSnapshot>(plan.InputsJson);
+
+    /// <summary>The plan's pace table; plans from before the LLM set paces have none, so their sessions are run by effort.</summary>
+    public static PaceTable PacesOf(TrainingPlan plan)
+    {
+        var snapshot = Of(plan);
+        return snapshot?.Paces ?? PaceTable.Empty(snapshot?.RaceKm > 0 ? snapshot.RaceKm : RaceProfiles.MarathonKm);
+    }
+}
 
 public sealed record WeeklyFocus(int Week, string Focus);
 
@@ -69,112 +79,9 @@ public static class AthleteClock
         DateOnly.FromDateTime(TimeZoneInfo.ConvertTime(instant, Zone(timeZoneId)).DateTime);
 }
 
-/// <summary>Applies <see cref="ProposedChange"/>s to workouts. Pure apart from mutating the given workouts.</summary>
+/// <summary>Snapshots, restores and copies planned workouts: the audit trail and undo of plan changes.</summary>
 public static class PlanAdjuster
 {
-    /// <summary>Returns deep copies of <paramref name="workouts"/> with the changes applied, for validation.</summary>
-    public static List<PlannedWorkout> Preview(IReadOnlyList<PlannedWorkout> workouts, IReadOnlyList<ProposedChange> changes, TrainingZones zones)
-    {
-        var copies = workouts.Select(Clone).ToList();
-        foreach (var change in changes)
-        {
-            Apply(copies, change, zones);
-        }
-
-        return copies;
-    }
-
-    /// <summary>Applies one change in place. Returns the workouts that were modified.</summary>
-    public static IReadOnlyList<PlannedWorkout> Apply(IList<PlannedWorkout> workouts, ProposedChange change, TrainingZones zones)
-    {
-        var target = workouts.FirstOrDefault(w => w.Id == change.WorkoutId);
-        if (target is null)
-        {
-            return [];
-        }
-
-        switch (change.Action)
-        {
-            case ChangeAction.SwapDays when change.NewDate is DateOnly newDate:
-                var other = workouts.FirstOrDefault(w => w.Date == newDate && w.Id != target.Id && w.PlanId == target.PlanId);
-                if (other is not null)
-                {
-                    other.Date = target.Date;
-                    MarkChanged(other);
-                }
-
-                target.Date = newDate;
-                MarkChanged(target);
-                return other is null ? [target] : [target, other];
-
-            case ChangeAction.ChangePace:
-                if (change.NewPaceMinSecPerKm is int newFast && target.PaceMinSecPerKm is int oldFast && oldFast > 0
-                    && WorkoutStructure.Parse(target.StepsJson) is { Count: > 0 } blocks)
-                {
-                    // Every part of a structured session moves with the headline pace.
-                    target.StepsJson = WorkoutStructure.Serialize(WorkoutStructure.ScalePaces(blocks, (double)newFast / oldFast));
-                }
-
-                target.PaceMinSecPerKm = change.NewPaceMinSecPerKm ?? target.PaceMinSecPerKm;
-                target.PaceMaxSecPerKm = change.NewPaceMaxSecPerKm ?? target.PaceMaxSecPerKm;
-                MarkChanged(target);
-                return [target];
-
-            case ChangeAction.ConvertToRest:
-                SetType(target, WorkoutType.Rest, 0, zones);
-                return [target];
-
-            default:
-                SetType(target, change.ToType, change.ToKm, zones);
-                return [target];
-        }
-    }
-
-    private static void SetType(PlannedWorkout w, WorkoutType type, double km, TrainingZones zones)
-    {
-        var typeChanged = w.Type != type;
-        var kmChanged = Math.Abs(w.TargetDistanceKm - km) > 0.01;
-        if (typeChanged)
-        {
-            // The structure belonged to the old session type; the new type is a plain run.
-            w.StepsJson = null;
-        }
-        else if (kmChanged && WorkoutStructure.Parse(w.StepsJson) is { Count: > 0 } blocks)
-        {
-            w.StepsJson = WorkoutStructure.Serialize(WorkoutStructure.Resize(blocks, km, zones));
-        }
-
-        w.Type = type;
-        w.TargetDistanceKm = type == WorkoutType.Rest ? 0 : km;
-        if (type == WorkoutType.Rest)
-        {
-            w.PaceMinSecPerKm = w.PaceMaxSecPerKm = w.HrMin = w.HrMax = w.TargetDurationMinutes = null;
-        }
-        else if (typeChanged)
-        {
-            var pace = zones.PaceFor(type);
-            var hr = zones.HrFor(type);
-            w.PaceMinSecPerKm = pace?.Fast;
-            w.PaceMaxSecPerKm = pace?.Slow;
-            w.HrMin = hr?.Min;
-            w.HrMax = hr?.Max;
-        }
-
-        if (type != WorkoutType.Rest && w.PaceMinSecPerKm is int fast && w.PaceMaxSecPerKm is int slow)
-        {
-            w.TargetDurationMinutes = (int)Math.Round(km * (fast + slow) / 2.0 / 60.0);
-        }
-
-        if (typeChanged)
-        {
-            // Title/description are regenerated by the caller for the new type.
-            w.Title = "";
-            w.Description = null;
-        }
-
-        MarkChanged(w);
-    }
-
     private static void MarkChanged(PlannedWorkout w)
     {
         if (w.CorosSyncStatus == SyncStatus.Synced)
@@ -211,10 +118,12 @@ public static class PlanAdjuster
         UpdatedAt = w.UpdatedAt,
     };
 
-    /// <summary>Snapshot used for the before/after audit trail in <see cref="PlanChange"/> and for undo.</summary>
-    public static string Snapshot(PlannedWorkout w) => CoachJson.Serialize(new WorkoutState(
+    public static WorkoutState State(PlannedWorkout w) => new(
         w.Date, w.Type, w.TargetDistanceKm, w.TargetDurationMinutes, w.PaceMinSecPerKm, w.PaceMaxSecPerKm, w.HrMin, w.HrMax, w.Title, w.Description,
-        w.StepsJson));
+        w.StepsJson);
+
+    /// <summary>Snapshot used for the before/after audit trail in <see cref="PlanChange"/> and for undo.</summary>
+    public static string Snapshot(PlannedWorkout w) => CoachJson.Serialize(State(w));
 
     public static void Restore(PlannedWorkout w, WorkoutState state)
     {
@@ -232,7 +141,3 @@ public static class PlanAdjuster
         MarkChanged(w);
     }
 }
-
-public sealed record WorkoutState(
-    DateOnly Date, WorkoutType Type, double Km, int? DurationMinutes, int? PaceMin, int? PaceMax, int? HrMin, int? HrMax, string Title, string? Description,
-    string? Steps = null);

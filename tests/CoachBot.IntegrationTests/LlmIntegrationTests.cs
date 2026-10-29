@@ -1,7 +1,7 @@
-using System.Text.Json;
 using System.Text.Json.Nodes;
 using CoachBot.Core.Abstractions;
 using CoachBot.Core.Domain;
+using CoachBot.Core.Planning;
 using CoachBot.Core.Safety;
 using CoachBot.Core.Services;
 using Microsoft.EntityFrameworkCore;
@@ -10,392 +10,365 @@ using Microsoft.Extensions.Time.Testing;
 
 namespace CoachBot.IntegrationTests;
 
-/// <summary>
-/// An LLM double that answers per prompt with scripted JSON. A null answer behaves like a real failure: the call
-/// throws <see cref="LlmException"/>.
-/// </summary>
-public sealed class ScriptedLlm(Func<LlmRequest, JsonNode, string?> respond) : ILlmClient
-{
-    public List<LlmRequest> Requests { get; } = [];
-    public string ProviderName => "scripted";
-
-    public Task<string> GenerateJsonAsync(LlmRequest request, CancellationToken ct)
-    {
-        Requests.Add(request);
-        var answer = respond(request, Context(request));
-        return answer is null
-            ? throw new LlmException(request.Purpose, LlmFailure.Empty, "scripted: no answer")
-            : Task.FromResult(answer);
-    }
-
-    /// <summary>The prompts embed their data as a ```json block.</summary>
-    public static JsonNode Context(LlmRequest request)
-    {
-        var start = request.UserPrompt.IndexOf("```json\n", StringComparison.Ordinal) + "```json\n".Length;
-        var end = request.UserPrompt.LastIndexOf("\n```", StringComparison.Ordinal);
-        return JsonNode.Parse(request.UserPrompt[start..end])!;
-    }
-
-    /// <summary>Echoes the rule-based baseline as the "AI design", optionally transformed.</summary>
-    public static string Design(JsonNode context, Func<JsonObject, JsonObject>? session = null, string rationale = "AI rationale")
-    {
-        var weeks = new JsonArray();
-        foreach (var week in context["baseline_plan"]!.AsArray())
-        {
-            var sessions = new JsonArray();
-            foreach (var s in week!["sessions"]!.AsArray())
-            {
-                var copy = s!.DeepClone().AsObject();
-                if (copy["type"]!.GetValue<string>() == "easy")
-                {
-                    copy["notes"] = "AI: relaxed and conversational";
-                }
-
-                sessions.Add(session is null ? copy : session(copy));
-            }
-
-            weeks.Add(new JsonObject
-            {
-                ["week"] = week["week"]!.GetValue<int>(),
-                ["phase"] = week["phase"]!.GetValue<string>(),
-                ["cutback"] = week["cutback"]!.GetValue<bool>(),
-                ["focus"] = "AI focus",
-                ["sessions"] = sessions,
-            });
-        }
-
-        return new JsonObject { ["rationale"] = rationale, ["weeks"] = weeks }.ToJsonString();
-    }
-}
-
+/// <summary>The LLM decides; these tests check what code does with its answers, and that a bad answer writes nothing.</summary>
 [Collection(PostgresCollection.Name)]
 public class LlmIntegrationTests(PostgresFixture pg)
 {
+    // Wednesday 21 Oct 2026, 07:00 in Ho Chi Minh City. Plans start on Monday 26 Oct.
     private static readonly DateTimeOffset Start = new(2026, 10, 21, 0, 0, 0, TimeSpan.Zero);
 
-    private static JsonObject Doubled(JsonObject s)
+    // Tuesday 27 Oct 2026, 12:00 local: the morning run of week 1 has been synced.
+    private static readonly DateTimeOffset TuesdayNoon = new(2026, 10, 27, 5, 0, 0, TimeSpan.Zero);
+
+    private sealed record Setup(ServiceProvider Sp, AsyncServiceScope Scope, Athlete Athlete, FakeTimeProvider Time, CapturingNotifier Notifier) : IAsyncDisposable
     {
-        s["km"] = s["km"]!.GetValue<double>() * 2;
-        return s;
+        public IServiceProvider S => Scope.ServiceProvider;
+
+        public async ValueTask DisposeAsync()
+        {
+            await Scope.DisposeAsync();
+            await Sp.DisposeAsync();
+        }
     }
 
-    private async Task<(ServiceProvider Sp, AsyncServiceScope Scope, Athlete Athlete)> SetupAsync(
-        ScriptedLlm llm, string scenario = "normal", RaceGoal? goal = null)
+    private async Task<Setup> SetupAsync(ScriptedLlm llm, string scenario = "normal", RaceGoal? goal = null)
     {
-        var sp = TestHost.Build(await pg.CreateDatabaseAsync(), new FakeTimeProvider(Start), new CapturingNotifier(), scenario, llm);
+        var time = new FakeTimeProvider(Start);
+        var notifier = new CapturingNotifier();
+        var sp = TestHost.Build(await pg.CreateDatabaseAsync(), time, notifier, scenario, llm);
         var scope = sp.CreateAsyncScope();
         var athletes = scope.ServiceProvider.GetRequiredService<AthleteService>();
         var athlete = await athletes.GetOrCreatePrimaryAsync(default);
         goal ??= new RaceGoal { RaceDate = new DateOnly(2027, 3, 7), GoalTimeSeconds = 4 * 3600, Name = "Hanoi Marathon", DistanceKm = 42.195 };
         await athletes.SetGoalAsync(athlete.Id, goal.RaceDate, goal.GoalTimeSeconds, goal.Name, goal.DistanceKm, default);
         await scope.ServiceProvider.GetRequiredService<SyncService>().SyncAsync(athlete, 56, 35, default);
-        return (sp, scope, athlete);
+        return new Setup(sp, scope, athlete, time, notifier);
+    }
+
+    /// <summary>Generates and approves a plan with the scripted defaults.</summary>
+    private static async Task<TrainingPlan> ActivePlanAsync(Setup t)
+    {
+        var plans = t.S.GetRequiredService<PlanService>();
+        var plan = (await plans.GenerateAsync(t.Athlete, default)).Plan!;
+        await plans.ApproveAsync(t.Athlete.Id, plan.Id, default);
+        return plan;
     }
 
     [Fact]
-    public async Task Llm_designed_plan_is_used_when_it_passes_every_safety_rule()
+    public async Task Llm_designed_plan_is_stored_with_its_pace_table()
     {
-        var llm = new ScriptedLlm((r, ctx) => r.Purpose == "plan_design" ? ScriptedLlm.Design(ctx) : null);
-        var (sp, scope, athlete) = await SetupAsync(llm);
-        await using var _ = sp;
-        await using var __ = scope;
+        var llm = new ScriptedLlm();
+        await using var t = await SetupAsync(llm);
 
-        var result = await scope.ServiceProvider.GetRequiredService<PlanService>().GenerateAsync(athlete, default);
+        var result = await t.S.GetRequiredService<PlanService>().GenerateAsync(t.Athlete, default);
 
         var plan = result.Plan!;
-        Assert.StartsWith("llm:", plan.GeneratedBy, StringComparison.Ordinal);
+        Assert.Equal("llm:scripted", plan.GeneratedBy);
         Assert.Equal("AI rationale", plan.Rationale);
+        Assert.Equal("[]", plan.WarningsJson);
+        Assert.Equal(PlanStatus.PendingApproval, plan.Status);
+        Assert.Equal(new DateOnly(2026, 10, 26), plan.StartDate);
+
+        Assert.Equal(new PaceRange(360, 400), PlanSnapshot.PacesOf(plan).PaceFor(Intensity.Easy));
+        var easy = plan.Workouts.First(w => w.Type == WorkoutType.Easy);
+        Assert.Equal((360, 400, 120, 145), (easy.PaceMinSecPerKm!.Value, easy.PaceMaxSecPerKm!.Value, easy.HrMin!.Value, easy.HrMax!.Value));
+        Assert.All(plan.Workouts, w => Assert.False(string.IsNullOrEmpty(w.Title)));
         Assert.Contains(plan.Workouts, w => w.Description!.StartsWith("AI: relaxed", StringComparison.Ordinal));
-        Assert.DoesNotContain("plan.llm_rejected", result.Warnings);
+        Assert.Equal(new DateOnly(2027, 3, 7), plan.Workouts.Single(w => w.Type == WorkoutType.Race).Date);
+
+        // The LLM gets the data and the plan window, and no rule-made limits, guidelines or baseline.
         var context = ScriptedLlm.Context(llm.Requests.Single(r => r.Purpose == "plan_design"));
-        Assert.NotNull(context["limits"]);
-        Assert.NotNull(context["guidelines"]);
-        Assert.Equal(athlete.RunDaysPerWeek, context["athlete"]!["run_days_per_week"]!.GetValue<int>());
+        Assert.Equal("2026-10-26", context["plan_window"]!["first_monday"]!.GetValue<string>());
+        Assert.Equal(19, context["plan_window"]!["weeks"]!.GetValue<int>());
+        Assert.NotNull(context["fitness"]!["weekly_km_oldest_first"]);
+        Assert.NotNull(context["assessment"]);
+        Assert.Null(context["limits"]);
+        Assert.Null(context["guidelines"]);
+        Assert.Null(context["baseline_plan"]);
+
+        Assert.Equal(new[] { "ok", "ok" }, await t.Scope.Db().LlmCalls.OrderBy(c => c.CreatedAt).Select(c => c.Status).ToListAsync());
     }
 
-    [Fact]
-    public async Task No_answer_from_the_llm_keeps_the_rule_based_plan_and_says_why()
-    {
-        var llm = new ScriptedLlm((_, _) => null);
-        var (sp, scope, athlete) = await SetupAsync(llm);
-        await using var _ = sp;
-        await using var __ = scope;
-
-        var result = await scope.ServiceProvider.GetRequiredService<PlanService>().GenerateAsync(athlete, default);
-
-        Assert.Equal("rules", result.Plan!.GeneratedBy);
-        Assert.Contains("plan.llm_unavailable", result.Warnings);
-        Assert.DoesNotContain("plan.llm_rejected", result.Warnings);
-    }
-
-    private const string Assessment = """
-        {"level":"intermediate","summary":"Consistent 35 km weeks; threshold work is missing.","goal_verdict":"ambitious",
-         "goal_comment":"1:50 needs about 3% more speed.","strengths":["consistent easy running"],
-         "limiters":[{"area":"threshold","evidence":"no runs faster than easy pace in 8 weeks"},{"area":"long_run_endurance","evidence":"longest run 16 km"}],
-         "risks":[],"priorities":[{"phase":"base","focus":"strides and hills"},{"phase":"build","focus":"cruise intervals"}]}
-        """;
-
-    /// <summary>Gives every quality session a structure that keeps its distance: warm-up, 2 repeats, cool-down.</summary>
+    /// <summary>Gives every quality session a structure: warm-up, 2 repeats, cool-down.</summary>
     private static JsonObject Structured(JsonObject s)
     {
-        var (title, intensity, repKm) = s["type"]!.GetValue<string>() switch
+        var (title, intensity) = s["type"]!.GetValue<string>() switch
         {
-            "tempo" => ("2 × 1.5 km at threshold", "threshold", 1.5),
-            "interval" => ("2 × 1.5 km at 5K pace", "five_k", 1.5),
-            "race_pace" => ("2 × 1.5 km at half-marathon pace", "race_pace", 1.5),
-            _ => (null, null, 0.0),
+            "tempo" => ("2 × 1.5 km at half-marathon pace", "race_pace"),
+            _ => ((string?)null, (string?)null),
         };
         if (title is null)
         {
             return s;
         }
 
-        var km = s["km"]!.GetValue<double>();
-        var easy = (km - 2 * (repKm + 0.5)) / 2;
+        s["type"] = "race_pace";
         s["title"] = title;
         s["steps"] = new JsonArray(
-            new JsonObject { ["repeat"] = 1, ["work"] = new JsonObject { ["intensity"] = "easy", ["km"] = easy } },
+            new JsonObject { ["repeat"] = 1, ["work"] = new JsonObject { ["intensity"] = "easy", ["km"] = 2 } },
             new JsonObject
             {
                 ["repeat"] = 2,
-                ["work"] = new JsonObject { ["intensity"] = intensity, ["km"] = repKm },
+                ["work"] = new JsonObject { ["intensity"] = intensity, ["km"] = 1.5 },
                 ["rest"] = new JsonObject { ["intensity"] = "recovery", ["km"] = 0.5 },
             },
-            new JsonObject { ["repeat"] = 1, ["work"] = new JsonObject { ["intensity"] = "easy", ["km"] = easy } });
+            new JsonObject { ["repeat"] = 1, ["work"] = new JsonObject { ["intensity"] = "easy", ["km"] = 2 } });
         return s;
     }
 
     [Fact]
     public async Task Half_marathon_goal_gets_a_diagnosis_and_structured_workouts()
     {
-        var llm = new ScriptedLlm((r, ctx) => r.Purpose switch
-        {
-            "athlete_assessment" => Assessment,
-            "plan_design" => ScriptedLlm.Design(ctx, Structured),
-            _ => null,
-        });
+        var llm = new ScriptedLlm((r, ctx) => r.Purpose == "plan_design" ? ScriptedLlm.Design(ctx, Structured) : ScriptedLlm.Default(r, ctx));
         var goal = new RaceGoal { RaceDate = new DateOnly(2027, 1, 24), GoalTimeSeconds = 6600, Name = "VnExpress Half", DistanceKm = 21.0975 };
-        var (sp, scope, athlete) = await SetupAsync(llm, goal: goal);
-        await using var _ = sp;
-        await using var __ = scope;
-        var plans = scope.ServiceProvider.GetRequiredService<PlanService>();
+        await using var t = await SetupAsync(llm, goal: goal);
+        var plans = t.S.GetRequiredService<PlanService>();
 
-        var result = await plans.GenerateAsync(athlete, default);
+        var plan = (await plans.GenerateAsync(t.Athlete, default)).Plan!;
 
-        var plan = result.Plan!;
-        Assert.StartsWith("llm:", plan.GeneratedBy, StringComparison.Ordinal);
-        var snapshot = CoachJson.Deserialize<PlanSnapshot>(plan.InputsJson)!;
-        Assert.Equal(21.0975, snapshot.Zones.RaceKm);
+        var snapshot = PlanSnapshot.Of(plan)!;
+        Assert.Equal(21.0975, snapshot.RaceKm);
         Assert.Equal("threshold", snapshot.Assessment!.Limiters![0].Area);
-        Assert.All(plan.Workouts.Where(w => w.Type != WorkoutType.Race), w => Assert.True(w.TargetDistanceKm <= 22));
         Assert.Equal(21.0975, plan.Workouts.Single(w => w.Type == WorkoutType.Race).TargetDistanceKm);
 
-        var structured = plan.Workouts.Where(w => w.StepsJson is not null).ToList();
-        Assert.NotEmpty(structured);
-        Assert.All(structured, w => Assert.Contains(" → ", w.Description, StringComparison.Ordinal));
-        Assert.Contains(structured, w => w.Title.StartsWith("2 × 1.5 km at half-marathon pace", StringComparison.Ordinal));
+        // "race_pace" is half-marathon pace for this goal, and the step paces come from the coach's table.
+        var structured = plan.Workouts.First(w => w.StepsJson is not null);
+        var blocks = WorkoutStructure.Parse(structured.StepsJson)!;
+        Assert.Equal(Intensity.HalfMarathon, blocks[1].Work.Intensity);
+        Assert.Equal(320, blocks[1].Work.PaceFast);
+        Assert.Equal((320, 150), (structured.PaceMinSecPerKm!.Value, structured.HrMin!.Value));
+        Assert.Equal(8, structured.TargetDistanceKm);
+        Assert.Contains(" → ", structured.Description, StringComparison.Ordinal);
+        Assert.StartsWith("2 × 1.5 km at half-marathon pace", structured.Title, StringComparison.Ordinal);
 
-        // The diagnosis reached the plan design and is shown to the athlete.
+        // The diagnosis reached the plan design and is shown to the athlete with the coach's prediction.
         var design = ScriptedLlm.Context(llm.Requests.Single(r => r.Purpose == "plan_design"));
         Assert.Equal("threshold", design["assessment"]!["limiters"]![0]!["area"]!.GetValue<string>());
-        Assert.Contains("at half_marathon", design["guidelines"]!["session_intensities"]!["race_pace"]!.GetValue<string>(), StringComparison.Ordinal);
-        var message = plans.RenderProposal(athlete, plan, (await scope.ServiceProvider.GetRequiredService<AthleteService>().GetActiveGoalAsync(athlete.Id, default))!, result.Warnings);
+        var message = plans.RenderProposal(t.Athlete, plan, (await t.S.GetRequiredService<AthleteService>().GetActiveGoalAsync(t.Athlete.Id, default))!);
         Assert.Contains("🩺", message.Text, StringComparison.Ordinal);
         Assert.Contains("threshold (lactate) pace (no runs faster than easy pace in 8 weeks)", message.Text, StringComparison.Ordinal);
         Assert.Contains("Half marathon", message.Text, StringComparison.Ordinal);
+        Assert.Contains("4:05:00", message.Text, StringComparison.Ordinal);
     }
 
     [Fact]
-    public async Task Intervals_hidden_in_an_easy_run_are_sent_back_for_repair()
+    public async Task Plan_generation_fails_without_writing_when_the_llm_fails()
     {
-        var hidden = false;
-        JsonObject Disguise(JsonObject s)
+        var llm = new ScriptedLlm((r, ctx) => r.Purpose == "plan_design" ? null : ScriptedLlm.Default(r, ctx));
+        await using var t = await SetupAsync(llm);
+
+        var ex = await Assert.ThrowsAsync<LlmException>(() => t.S.GetRequiredService<PlanService>().GenerateAsync(t.Athlete, default));
+
+        Assert.Equal(LlmFailure.Empty, ex.Reason);
+        Assert.Equal(0, await t.Scope.Db().TrainingPlans.CountAsync());
+        Assert.Equal("empty", (await t.Scope.Db().LlmCalls.SingleAsync(c => c.Purpose == "plan_design")).Status);
+    }
+
+    [Fact]
+    public async Task A_design_that_does_not_fit_fails_without_writing()
+    {
+        static JsonObject SameDay(JsonObject s)
         {
-            if (hidden || s["type"]!.GetValue<string>() != "easy" || s["km"]!.GetValue<double>() < 6)
+            if (s["type"]!.GetValue<string>() == "tempo")
             {
-                return s;
-            }
-
-            hidden = true;
-            var km = s["km"]!.GetValue<double>();
-            s["steps"] = new JsonArray(
-                new JsonObject { ["repeat"] = 1, ["work"] = new JsonObject { ["intensity"] = "easy", ["km"] = km - 4 } },
-                new JsonObject { ["repeat"] = 4, ["work"] = new JsonObject { ["intensity"] = "five_k", ["km"] = 1 } });
-            return s;
-        }
-
-        var llm = new ScriptedLlm((r, ctx) => r.Purpose switch
-        {
-            "plan_design" => ScriptedLlm.Design(ctx, Disguise),
-            "plan_design_repair" => ScriptedLlm.Design(ctx["context"]!, rationale: "repaired"),
-            _ => null,
-        });
-        var (sp, scope, athlete) = await SetupAsync(llm);
-        await using var _ = sp;
-        await using var __ = scope;
-
-        var result = await scope.ServiceProvider.GetRequiredService<PlanService>().GenerateAsync(athlete, default);
-
-        Assert.Equal("repaired", result.Plan!.Rationale);
-        var repair = ScriptedLlm.Context(llm.Requests.Single(r => r.Purpose == "plan_design_repair"));
-        Assert.Contains("steps_intensity_not_allowed", repair["violations"]!.ToJsonString(), StringComparison.Ordinal);
-    }
-
-    [Fact]
-    public async Task Unsafe_llm_plan_gets_one_repair_attempt_then_is_clamped_to_the_limits()
-    {
-        var llm = new ScriptedLlm((r, ctx) => r.Purpose switch
-        {
-            "plan_design" => ScriptedLlm.Design(ctx, Doubled),
-            "plan_design_repair" => ScriptedLlm.Design(ctx["context"]!, Doubled, rationale: "still too much"),
-            _ => null,
-        });
-        var (sp, scope, athlete) = await SetupAsync(llm);
-        await using var _ = sp;
-        await using var __ = scope;
-
-        var result = await scope.ServiceProvider.GetRequiredService<PlanService>().GenerateAsync(athlete, default);
-
-        var plan = result.Plan!;
-        Assert.StartsWith("llm:", plan.GeneratedBy, StringComparison.Ordinal);
-        Assert.Contains("plan.llm_clamped", result.Warnings);
-        Assert.DoesNotContain("plan.llm_rejected", result.Warnings);
-        Assert.Equal("still too much", plan.Rationale);
-        Assert.Contains(plan.Workouts, w => w.Description?.StartsWith("AI:", StringComparison.Ordinal) == true);
-        var repair = ScriptedLlm.Context(llm.Requests.Single(r => r.Purpose == "plan_design_repair"));
-        Assert.Contains("volume_increase_too_large", repair["violations"]!.ToJsonString(), StringComparison.Ordinal);
-
-        var snapshot = CoachJson.Deserialize<PlanSnapshot>(plan.InputsJson)!;
-        var goal = (await scope.ServiceProvider.GetRequiredService<AthleteService>().GetActiveGoalAsync(athlete.Id, default))!;
-        Assert.DoesNotContain(new PlanValidator(new SafetyOptions().ForRace(goal.DistanceKm))
-            .ValidatePlan([.. plan.Workouts], snapshot.Baseline, snapshot.Zones, new PlanConstraints(goal.RaceDate, Math.Clamp(athlete.RunDaysPerWeek, 3, 6))), v => !v.IsGuideline);
-    }
-
-    [Fact]
-    public async Task Llm_plan_beyond_coaching_guidelines_is_accepted_without_repair()
-    {
-        static JsonObject AllQuality(JsonObject s)
-        {
-            if (s["type"]!.GetValue<string>() == "easy")
-            {
-                s["type"] = "tempo";
+                s["day"] = "tue"; // two sessions on Tuesday
             }
 
             return s;
         }
 
-        var llm = new ScriptedLlm((r, ctx) => r.Purpose == "plan_design" ? ScriptedLlm.Design(ctx, AllQuality) : null);
-        var (sp, scope, athlete) = await SetupAsync(llm);
-        await using var _ = sp;
-        await using var __ = scope;
+        var llm = new ScriptedLlm((r, ctx) => r.Purpose == "plan_design" ? ScriptedLlm.Design(ctx, SameDay) : ScriptedLlm.Default(r, ctx));
+        await using var t = await SetupAsync(llm);
 
-        var result = await scope.ServiceProvider.GetRequiredService<PlanService>().GenerateAsync(athlete, default);
+        var ex = await Assert.ThrowsAsync<LlmException>(() => t.S.GetRequiredService<PlanService>().GenerateAsync(t.Athlete, default));
 
-        Assert.StartsWith("llm:", result.Plan!.GeneratedBy, StringComparison.Ordinal);
-        Assert.DoesNotContain(llm.Requests, r => r.Purpose == "plan_design_repair");
-        Assert.Contains("plan.guideline.quality", result.Warnings);
-        Assert.Contains("plan.guideline.easy_share", result.Warnings);
+        Assert.Equal(LlmFailure.Integrity, ex.Reason);
+        Assert.Contains("two_sessions_same_day", ex.Detail, StringComparison.Ordinal);
+        Assert.Equal(0, await t.Scope.Db().TrainingPlans.CountAsync());
+        var call = await t.Scope.Db().LlmCalls.SingleAsync(c => c.Purpose == "plan_design");
+        Assert.Equal("integrity", call.Status);
+        Assert.NotNull(call.Response);
     }
 
     [Fact]
-    public async Task Successful_repair_is_accepted()
+    public async Task Run_analysis_matches_the_named_session_and_splits_changes_into_applied_and_proposed()
     {
-        var llm = new ScriptedLlm((r, ctx) => r.Purpose switch
+        var llm = new ScriptedLlm((r, ctx) =>
         {
-            "plan_design" => ScriptedLlm.Design(ctx, Doubled),
-            "plan_design_repair" => ScriptedLlm.Design(ctx["context"]!, rationale: "repaired"),
-            _ => null,
+            if (r.Purpose != "run_analysis")
+            {
+                return ScriptedLlm.Default(r, ctx);
+            }
+
+            var sessions = ctx["plan"]!["sessions"]!.AsArray();
+            string Id(string type) => sessions.First(s => s!["type"]!.GetValue<string>() == type && s["status"]!.GetValue<string>() == "planned")!["workout_id"]!.GetValue<string>();
+            string Date(string type) => sessions.First(s => s!["type"]!.GetValue<string>() == type)!["date"]!.GetValue<string>();
+            return new JsonObject
+            {
+                ["summary"] = "Heavy legs today.",
+                ["matched_workout_id"] = ScriptedLlm.PlannedSessionOn(ctx, ctx["run"]!["date"]!.GetValue<string>()),
+                ["pace_status"] = "slower",
+                ["hr_status"] = "above",
+                ["readiness"] = ScriptedLlm.Readiness("amber", "HRV is down and resting HR is up.", "HRV 42 ms"),
+                ["changes"] = new JsonArray(
+                    ScriptedLlm.Change(Id("tempo"), Date("tempo"), "easy", 6, needsApproval: false),
+                    ScriptedLlm.Change(Id("long"), Date("long"), "long", 12, needsApproval: true)),
+                ["symptom_concerns"] = new JsonArray(),
+            }.ToJsonString();
         });
-        var (sp, scope, athlete) = await SetupAsync(llm);
-        await using var _ = sp;
-        await using var __ = scope;
+        await using var t = await SetupAsync(llm);
+        var plan = await ActivePlanAsync(t);
+        t.Time.SetUtcNow(TuesdayNoon);
+        await t.S.GetRequiredService<SyncService>().SyncAsync(t.Athlete, 3, 7, default);
 
-        var plan = (await scope.ServiceProvider.GetRequiredService<PlanService>().GenerateAsync(athlete, default)).Plan!;
+        Assert.Equal(1, await t.S.GetRequiredService<AnalysisService>().AnalyzePendingAsync(t.Athlete, default));
 
-        Assert.StartsWith("llm:", plan.GeneratedBy, StringComparison.Ordinal);
-        Assert.Equal("repaired", plan.Rationale);
+        var db = t.Scope.Db();
+        var analysis = await db.RunAnalyses.SingleAsync();
+        var tuesday = plan.Workouts.Single(w => w.Date == new DateOnly(2026, 10, 27));
+        Assert.Equal(tuesday.Id, analysis.PlannedWorkoutId);
+        Assert.Equal((ReadinessLevel.Amber, "slower", "above"), (analysis.Readiness, analysis.PaceStatus, analysis.HrStatus));
+        Assert.Equal(1.0, analysis.DistanceRatio);
+        Assert.Equal(WorkoutStatus.Completed, tuesday.Status);
+        Assert.Equal(analysis.ActivityId, tuesday.CompletedActivityId);
+
+        var check = await db.ReadinessChecks.SingleAsync();
+        Assert.Equal((new DateOnly(2026, 10, 27), ReadinessLevel.Amber, "run_analysis"), (check.Date, check.Level, check.Source));
+
+        var applied = await db.Recommendations.SingleAsync(r => r.Status == RecommendationStatus.AutoApplied);
+        var proposed = await db.Recommendations.SingleAsync(r => r.Status == RecommendationStatus.Proposed);
+        Assert.Equal((ChangeMagnitude.Minor, ChangeMagnitude.Major), (applied.Magnitude, proposed.Magnitude));
+        var thursday = plan.Workouts.Single(w => w.Date == new DateOnly(2026, 10, 29));
+        Assert.Equal((WorkoutType.Easy, 6.0, 360), (thursday.Type, thursday.TargetDistanceKm, thursday.PaceMinSecPerKm!.Value));
+        var longRun = plan.Workouts.Single(w => w.Date == new DateOnly(2026, 11, 1));
+        Assert.Equal(14, longRun.TargetDistanceKm); // waits for approval
+        Assert.Equal(1, await db.PlanChanges.CountAsync());
+
+        var message = t.Notifier.Messages.Last();
+        Assert.Contains("🟠", message.Text, StringComparison.Ordinal);
+        Assert.Contains("→", message.Text, StringComparison.Ordinal);
+        var buttons = message.Buttons!.SelectMany(r => r).Select(b => b.CallbackData).ToList();
+        Assert.Contains($"rec:undo:{applied.Id}", buttons);
+        Assert.Contains($"rec:approve:{proposed.Id}", buttons);
+        Assert.Contains(buttons, b => b.StartsWith("rpe:", StringComparison.Ordinal));
+        Assert.Equal("fatigue:2026-10-27", (await db.Alerts.SingleAsync(a => a.Type == AlertType.Fatigue)).DedupKey);
+
+        // Approving applies exactly what was shown; undo restores the auto-applied change.
+        var recommendations = t.S.GetRequiredService<RecommendationService>();
+        Assert.Equal(DecisionOutcome.Done, (await recommendations.ApproveAsync(t.Athlete, proposed.Id, default)).Outcome);
+        Assert.Equal(12, (await db.PlannedWorkouts.AsNoTracking().SingleAsync(w => w.Id == longRun.Id)).TargetDistanceKm);
+        Assert.Equal(DecisionOutcome.Done, await recommendations.UndoAsync(t.Athlete, applied.Id, default));
+        var restored = await db.PlannedWorkouts.AsNoTracking().SingleAsync(w => w.Id == thursday.Id);
+        Assert.Equal((WorkoutType.Tempo, 8.0), (restored.Type, restored.TargetDistanceKm));
+    }
+
+    [Fact]
+    public async Task A_failed_analysis_writes_nothing_and_is_retried_at_the_next_sync()
+    {
+        var broken = true;
+        var llm = new ScriptedLlm((r, ctx) =>
+        {
+            if (r.Purpose != "run_analysis" || !broken)
+            {
+                return ScriptedLlm.Default(r, ctx);
+            }
+
+            // A change to a session the LLM was not offered: unusable.
+            var answer = JsonNode.Parse(ScriptedLlm.Default(r, ctx)!)!.AsObject();
+            answer["changes"] = new JsonArray(ScriptedLlm.Change(Guid.NewGuid().ToString(), "2026-10-29", "easy", 6, needsApproval: false));
+            return answer.ToJsonString();
+        });
+        await using var t = await SetupAsync(llm);
+        var plan = await ActivePlanAsync(t);
+        t.Time.SetUtcNow(TuesdayNoon);
+        await t.S.GetRequiredService<SyncService>().SyncAsync(t.Athlete, 3, 7, default);
+        var analysis = t.S.GetRequiredService<AnalysisService>();
+        var db = t.Scope.Db();
+
+        Assert.Equal(0, await analysis.AnalyzePendingAsync(t.Athlete, default));
+
+        Assert.Equal(0, await db.RunAnalyses.CountAsync());
+        Assert.Equal(0, await db.ReadinessChecks.CountAsync());
+        Assert.Equal(WorkoutStatus.Planned, (await db.PlannedWorkouts.AsNoTracking().SingleAsync(w => w.Date == new DateOnly(2026, 10, 27) && w.PlanId == plan.Id)).Status);
+        Assert.Contains("/sync", t.Notifier.Messages.Last().Text, StringComparison.Ordinal);
+        Assert.Equal("integrity", (await db.LlmCalls.SingleAsync(c => c.Purpose == "run_analysis")).Status);
+
+        broken = false;
+        Assert.Equal(1, await analysis.AnalyzePendingAsync(t.Athlete, default));
+        Assert.Equal(1, await db.RunAnalyses.CountAsync());
+        Assert.Single(await db.Alerts.Where(a => a.Type == AlertType.AnalysisFailure).ToListAsync());
+        Assert.Equal(new[] { "integrity", "ok" }, await db.LlmCalls.Where(c => c.Purpose == "run_analysis").OrderBy(c => c.CreatedAt).Select(c => c.Status).ToListAsync());
+    }
+
+    [Fact]
+    public async Task Daily_check_stores_the_verdict_and_is_silent_without_a_plan()
+    {
+        var llm = new ScriptedLlm((r, ctx) => r.Purpose == "daily_check"
+            ? new JsonObject
+            {
+                ["readiness"] = ScriptedLlm.Readiness("red", "Resting HR is 9 bpm above normal.", "resting HR 58"),
+                ["advice"] = "Rest today.",
+                ["changes"] = new JsonArray(ScriptedLlm.Change(
+                    ScriptedLlm.PlannedSessionOn(ctx, ctx["today"]!.GetValue<string>())!, ctx["today"]!.GetValue<string>(), "rest", 0, needsApproval: false)),
+            }.ToJsonString()
+            : ScriptedLlm.Default(r, ctx));
+        await using var t = await SetupAsync(llm);
+        var reports = t.S.GetRequiredService<ReportService>();
+
+        Assert.Null(await reports.DailyCheckAsync(t.Athlete, default));
+        Assert.DoesNotContain(llm.Requests, r => r.Purpose == "daily_check");
+        Assert.Contains("No readiness check yet", (await reports.TodayAsync(t.Athlete, default)).Text, StringComparison.Ordinal);
+
+        var plan = await ActivePlanAsync(t);
+        t.Time.SetUtcNow(new DateTimeOffset(2026, 10, 26, 23, 30, 0, TimeSpan.Zero)); // Tue 27 Oct 06:30
+        var message = (await reports.DailyCheckAsync(t.Athlete, default))!;
+
+        Assert.Contains("Rest today.", message.Text, StringComparison.Ordinal);
+        Assert.Contains("🔴", message.Text, StringComparison.Ordinal);
+        Assert.Contains(message.Buttons!.SelectMany(r => r), b => b.CallbackData.StartsWith("rec:undo:", StringComparison.Ordinal));
+        var check = await t.Scope.Db().ReadinessChecks.SingleAsync();
+        Assert.Equal((ReadinessLevel.Red, "daily_check"), (check.Level, check.Source));
+        Assert.Equal(WorkoutType.Rest, plan.Workouts.Single(w => w.Date == new DateOnly(2026, 10, 27)).Type);
+        Assert.Contains("checked", (await reports.TodayAsync(t.Athlete, default)).Text, StringComparison.Ordinal);
     }
 
     [Fact]
     public async Task Negated_keyword_asks_for_confirmation_instead_of_pausing()
     {
-        var llm = new ScriptedLlm((r, _) => r.Purpose == "symptom_triage"
+        var llm = new ScriptedLlm((r, ctx) => r.Purpose == "symptom_triage"
             ? """{"category":"none","is_current":false,"evidence":"không hề đau ngực"}"""
-            : null);
-        var (sp, scope, athlete) = await SetupAsync(llm);
-        await using var _ = sp;
-        await using var __ = scope;
-        var s = scope.ServiceProvider;
-        var plan = (await s.GetRequiredService<PlanService>().GenerateAsync(athlete, default)).Plan!;
-        await s.GetRequiredService<PlanService>().ApproveAsync(athlete.Id, plan.Id, default);
+            : ScriptedLlm.Default(r, ctx));
+        await using var t = await SetupAsync(llm);
+        var plan = await ActivePlanAsync(t);
 
-        var reply = await s.GetRequiredService<FeedbackService>().RecordNoteAsync(athlete, "Hôm nay chạy ổn, không hề đau ngực hay chóng mặt", false, default);
+        var reply = await t.S.GetRequiredService<FeedbackService>().RecordNoteAsync(t.Athlete, "Hôm nay chạy ổn, không hề đau ngực hay chóng mặt", false, default);
 
         var buttons = reply.Buttons!.SelectMany(b => b).Select(b => b.CallbackData).ToList();
         Assert.Contains("sym:cardiac", buttons);
         Assert.Contains("sym:none", buttons);
-        Assert.Equal(PlanStatus.Active, (await scope.Db().TrainingPlans.SingleAsync(p => p.Id == plan.Id)).Status);
-        Assert.False((await scope.Db().Feedback.SingleAsync(f => f.Notes != null)).RedFlag);
+        Assert.Equal(PlanStatus.Active, (await t.Scope.Db().TrainingPlans.SingleAsync(p => p.Id == plan.Id)).Status);
+        Assert.False((await t.Scope.Db().Feedback.SingleAsync(f => f.Notes != null)).RedFlag);
 
         // The athlete confirms after all: the plan is paused.
-        await s.GetRequiredService<FeedbackService>().ReportCategoryAsync(athlete, SymptomCategory.Cardiac, default);
-        Assert.Equal(PlanStatus.Paused, (await scope.Db().TrainingPlans.SingleAsync(p => p.Id == plan.Id)).Status);
+        await t.S.GetRequiredService<FeedbackService>().ReportCategoryAsync(t.Athlete, SymptomCategory.Cardiac, default);
+        Assert.Equal(PlanStatus.Paused, (await t.Scope.Db().TrainingPlans.SingleAsync(p => p.Id == plan.Id)).Status);
     }
 
     [Fact]
     public async Task Symptom_found_only_by_the_llm_pauses_immediately()
     {
-        var llm = new ScriptedLlm((r, _) => r.Purpose == "symptom_triage"
+        var llm = new ScriptedLlm((r, ctx) => r.Purpose == "symptom_triage"
             ? """{"category":"injury","is_current":true,"evidence":"đầu gối nhói khi xuống dốc"}"""
-            : null);
-        var (sp, scope, athlete) = await SetupAsync(llm);
-        await using var _ = sp;
-        await using var __ = scope;
-        var s = scope.ServiceProvider;
-        var plan = (await s.GetRequiredService<PlanService>().GenerateAsync(athlete, default)).Plan!;
-        await s.GetRequiredService<PlanService>().ApproveAsync(athlete.Id, plan.Id, default);
+            : ScriptedLlm.Default(r, ctx));
+        await using var t = await SetupAsync(llm);
+        var plan = await ActivePlanAsync(t);
         const string message = "Đầu gối trái nhói mỗi lần xuống dốc từ hôm qua";
         Assert.False(SymptomDetector.Detect(message).IsRedFlag); // keywords alone would miss it
 
-        var reply = await s.GetRequiredService<FeedbackService>().RecordNoteAsync(athlete, message, false, default);
+        var reply = await t.S.GetRequiredService<FeedbackService>().RecordNoteAsync(t.Athlete, message, false, default);
 
         Assert.Contains("🛑", reply.Text, StringComparison.Ordinal);
-        Assert.Equal(PlanStatus.Paused, (await scope.Db().TrainingPlans.SingleAsync(p => p.Id == plan.Id)).Status);
-        Assert.Equal(SymptomCategory.Injury, (await scope.Db().Feedback.SingleAsync(f => f.Notes != null)).Symptom);
-    }
-
-    [Fact]
-    public async Task Llm_progression_is_a_separate_major_proposal_and_only_on_green_days()
-    {
-        var (sp, scope, athlete) = await SetupAsync(new ScriptedLlm((_, _) => null));
-        await using var _ = sp;
-        await using var __ = scope;
-        var s = scope.ServiceProvider;
-        var plan = (await s.GetRequiredService<PlanService>().GenerateAsync(athlete, default)).Plan!;
-        await s.GetRequiredService<PlanService>().ApproveAsync(athlete.Id, plan.Id, default);
-        var today = new DateOnly(2026, 10, 25);
-        var easy = plan.Workouts.Where(w => w.WeekIndex == 0 && w.Type == WorkoutType.Easy).OrderBy(w => w.Date).First();
-        var originalKm = easy.TargetDistanceKm;
-        var increase = new ProposedChange(easy.Id, default, ChangeAction.IncreaseDistance, WorkoutType.Rest, WorkoutType.Easy, 0, easy.TargetDistanceKm + 1);
-        var recommendations = s.GetRequiredService<RecommendationService>();
-
-        var amber = await recommendations.CreateAsync(athlete, plan, [], [increase],
-            new ReadinessAssessment(ReadinessLevel.Amber, Confidence.High, [], []), "llm_easing", "s", null, today, default);
-        Assert.Empty(amber);
-
-        var green = await recommendations.CreateAsync(athlete, plan, [], [increase],
-            new ReadinessAssessment(ReadinessLevel.Green, Confidence.High, [], []), "llm_easing", "s", null, today, default);
-        var rec = Assert.Single(green);
-        Assert.Equal("llm_progression", rec.Trigger);
-        Assert.Equal(ChangeMagnitude.Major, rec.Magnitude);
-        Assert.Equal(RecommendationStatus.Proposed, rec.Status);
-        Assert.Equal(0, await scope.Db().PlanChanges.CountAsync());
-
-        Assert.Equal(originalKm, easy.TargetDistanceKm); // nothing changes before approval
-
-        Assert.Equal(DecisionOutcome.Done, (await recommendations.ApproveAsync(athlete, rec.Id, default)).Outcome);
-        var stored = await scope.Db().PlannedWorkouts.AsNoTracking().SingleAsync(w => w.Id == easy.Id);
-        Assert.Equal(originalKm + 1, stored.TargetDistanceKm);
-        Assert.Equal("athlete", (await scope.Db().PlanChanges.SingleAsync()).AppliedBy);
+        Assert.Equal(PlanStatus.Paused, (await t.Scope.Db().TrainingPlans.SingleAsync(p => p.Id == plan.Id)).Status);
+        Assert.Equal(SymptomCategory.Injury, (await t.Scope.Db().Feedback.SingleAsync(f => f.Notes != null)).Symptom);
     }
 }

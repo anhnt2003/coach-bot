@@ -1,7 +1,7 @@
+using System.Text.Json.Nodes;
 using CoachBot.Core.Abstractions;
 using CoachBot.Core.Domain;
 using CoachBot.Core.Planning;
-using CoachBot.Core.Safety;
 using CoachBot.Core.Services;
 using CoachBot.Infrastructure.Coros;
 using CoachBot.Infrastructure.Scheduling;
@@ -160,13 +160,41 @@ public class EndToEndTests(PostgresFixture pg)
         Assert.Contains("did not answer in time", text, StringComparison.Ordinal);
     }
 
+    /// <summary>A tired run: red readiness, Thursday's tempo eased at once, Sunday's long run shortened if the athlete agrees.</summary>
+    private static string Fatigued(JsonNode ctx)
+    {
+        var sessions = ctx["plan"]!["sessions"]!.AsArray();
+        JsonNode First(string type) => sessions.First(s => s!["type"]!.GetValue<string>() == type && s["status"]!.GetValue<string>() == "planned")!;
+        string Id(JsonNode s) => s["workout_id"]!.GetValue<string>();
+        string Date(JsonNode s) => s["date"]!.GetValue<string>();
+        var tempo = First("tempo");
+        var longRun = First("long");
+        return new JsonObject
+        {
+            ["summary"] = "You ran it, but everything says you are tired.",
+            ["matched_workout_id"] = ScriptedLlm.PlannedSessionOn(ctx, ctx["run"]!["date"]!.GetValue<string>()),
+            ["pace_status"] = "slower",
+            ["hr_status"] = "above",
+            ["readiness"] = ScriptedLlm.Readiness("red", "HRV is far below normal and resting HR is up.", "HRV 42 ms", "resting HR 58"),
+            ["changes"] = new JsonArray(
+                ScriptedLlm.Change(Id(tempo), Date(tempo), "easy", 6, needsApproval: false),
+                ScriptedLlm.Change(Id(longRun), Date(longRun), "long", 12, needsApproval: true)),
+            ["symptom_concerns"] = new JsonArray(),
+        }.ToJsonString();
+    }
+
     [Fact]
     public async Task Full_coaching_loop_with_fatigue_approval_symptom_pause_and_resume()
     {
         var time = new FakeTimeProvider(Start);
         var notifier = new CapturingNotifier();
-        await using var sp = TestHost.Build(await pg.CreateDatabaseAsync(), time, notifier, scenario: "fatigued");
-        Guid athleteId;
+        var llm = new ScriptedLlm((r, ctx) => r.Purpose switch
+        {
+            "run_analysis" => Fatigued(ctx),
+            "symptom_triage" => """{"category":"cardiac","is_current":true,"evidence":"chest pain"}""",
+            _ => ScriptedLlm.Default(r, ctx),
+        });
+        await using var sp = TestHost.Build(await pg.CreateDatabaseAsync(), time, notifier, "fatigued", llm);
         Guid planId;
 
         // 1. Onboarding: goal, history backfill, plan proposal, approval, push to (fake) COROS.
@@ -175,7 +203,6 @@ public class EndToEndTests(PostgresFixture pg)
             var s = scope.ServiceProvider;
             var athletes = s.GetRequiredService<AthleteService>();
             var athlete = await athletes.LinkTelegramAsync(42, "Anh", default);
-            athleteId = athlete.Id;
             await athletes.SetGoalAsync(athlete.Id, new DateOnly(2027, 3, 7), 4 * 3600, "Hanoi Marathon", 42.195, default);
             Assert.True((await s.GetRequiredService<SyncService>().SyncAsync(athlete, 56, 35, default)).Success);
 
@@ -185,13 +212,10 @@ public class EndToEndTests(PostgresFixture pg)
             var plan = result.Plan!;
             planId = plan.Id;
             Assert.Equal(PlanStatus.PendingApproval, plan.Status);
-            Assert.Equal(ZoneBasis.CorosThreshold, CoachJson.Deserialize<PlanSnapshot>(plan.InputsJson)!.Zones.Basis);
+            Assert.NotEmpty(PlanSnapshot.PacesOf(plan).Entries);
             Assert.All(plan.Workouts, w => Assert.False(string.IsNullOrEmpty(w.Title)));
 
-            var snapshot = CoachJson.Deserialize<PlanSnapshot>(plan.InputsJson)!;
-            Assert.Empty(new PlanValidator(new SafetyOptions()).ValidatePlan(plan.Workouts, snapshot.Baseline, snapshot.Zones));
-
-            var proposal = plans.RenderProposal(athlete, plan, (await athletes.GetActiveGoalAsync(athlete.Id, default))!, result.Warnings);
+            var proposal = plans.RenderProposal(athlete, plan, (await athletes.GetActiveGoalAsync(athlete.Id, default))!);
             Assert.Contains($"plan:approve:{plan.Id}", proposal.Buttons!.SelectMany(r => r).Select(b => b.CallbackData));
 
             Assert.NotNull((await plans.ApproveAsync(athlete.Id, plan.Id, default)).Plan);
@@ -200,82 +224,63 @@ public class EndToEndTests(PostgresFixture pg)
             Assert.Equal(push.Pushed, FakeCorosGateway.PushedWorkouts.Count);
         }
 
-        // 2. Tuesday of week 1, after the morning run: fatigue for three days → deload proposal (major, needs approval).
+        // 2. Tuesday of week 1, after the morning run: the coach eases Thursday at once and proposes a shorter long run.
         time.SetUtcNow(new DateTimeOffset(2026, 10, 27, 5, 0, 0, TimeSpan.Zero));
-        Recommendation rec;
+        Recommendation applied, proposed;
         await using (var scope = sp.CreateAsyncScope())
         {
             var s = scope.ServiceProvider;
             var athlete = await scope.Db().Athletes.SingleAsync();
             var sync = await s.GetRequiredService<SyncService>().SyncAsync(athlete, 3, 7, default);
-            // Sat + Sun (before the plan started) and today's run. Older runs are recorded but never trigger adaptations.
-            Assert.Equal(3, sync.NewRunIds.Count);
+            Assert.Equal(3, sync.NewRunIds.Count); // Sat + Sun before the plan started, and today's run
+            Assert.True((await s.GetRequiredService<CorosPushService>().PushUpcomingAsync(athlete, default)).Pushed >= 1);
             var messagesBefore = notifier.Messages.Count;
+
             // Only today's run is recent enough to analyze.
             Assert.Equal(1, await s.GetRequiredService<AnalysisService>().AnalyzePendingAsync(athlete, default));
             Assert.Equal(messagesBefore + 1, notifier.Messages.Count);
 
-            var analysis = await scope.Db().RunAnalyses.SingleAsync(r => r.PlannedWorkoutId != null);
+            var analysis = await scope.Db().RunAnalyses.SingleAsync();
             Assert.Equal(ReadinessLevel.Red, analysis.Readiness);
-            Assert.NotNull(analysis.PlannedWorkoutId);
             Assert.Equal(WorkoutStatus.Completed, (await scope.Db().PlannedWorkouts.SingleAsync(w => w.Id == analysis.PlannedWorkoutId)).Status);
 
-            rec = await scope.Db().Recommendations.SingleAsync();
-            Assert.Equal(ChangeMagnitude.Major, rec.Magnitude);
-            Assert.Equal(RecommendationStatus.Proposed, rec.Status);
-            Assert.Equal("adapt.deload", rec.Trigger);
-            Assert.Equal(0, await scope.Db().PlanChanges.CountAsync()); // nothing applied before approval
+            applied = await scope.Db().Recommendations.SingleAsync(r => r.Status == RecommendationStatus.AutoApplied);
+            proposed = await scope.Db().Recommendations.SingleAsync(r => r.Status == RecommendationStatus.Proposed);
+            Assert.Equal("run_analysis", applied.Trigger);
+            var thursday = await scope.Db().PlannedWorkouts.SingleAsync(w => w.PlanId == planId && w.Date == new DateOnly(2026, 10, 29));
+            Assert.Equal((WorkoutType.Easy, 6.0), (thursday.Type, thursday.TargetDistanceKm));
+            Assert.True(thursday.CorosDirty, "already on the COROS calendar, so it is pushed again");
+            Assert.Single(await scope.Db().PlanChanges.ToListAsync()); // the proposal waits for approval
 
             var message = notifier.Messages.Last();
             Assert.Contains("🔴", message.Text, StringComparison.Ordinal);
             var buttons = message.Buttons!.SelectMany(r => r).Select(b => b.CallbackData).ToList();
-            Assert.Contains($"rec:approve:{rec.Id}", buttons);
+            Assert.Contains($"rec:approve:{proposed.Id}", buttons);
+            Assert.Contains($"rec:undo:{applied.Id}", buttons);
             Assert.Contains(buttons, b => b.StartsWith("rpe:", StringComparison.Ordinal));
             Assert.Single(await scope.Db().Alerts.Where(a => a.Type == AlertType.Fatigue).ToListAsync());
         }
 
-        // 3. Athlete approves: changes applied with audit trail; already-pushed workouts are marked for update.
+        // 3. Athlete approves: the change is applied with an audit trail and pushed again.
         await using (var scope = sp.CreateAsyncScope())
         {
             var s = scope.ServiceProvider;
             var athlete = await scope.Db().Athletes.SingleAsync();
-            var before = await scope.Db().PlannedWorkouts.AsNoTracking().Where(w => w.PlanId == planId).ToDictionaryAsync(w => w.Id);
-            var (outcome, _) = await s.GetRequiredService<RecommendationService>().ApproveAsync(athlete, rec.Id, default);
-            Assert.Equal(DecisionOutcome.Done, outcome);
+            Assert.Equal(DecisionOutcome.Done, (await s.GetRequiredService<RecommendationService>().ApproveAsync(athlete, proposed.Id, default)).Outcome);
 
-            var changes = await scope.Db().PlanChanges.Where(c => c.RecommendationId == rec.Id).ToListAsync();
-            Assert.NotEmpty(changes);
-            foreach (var change in changes)
-            {
-                var after = await scope.Db().PlannedWorkouts.SingleAsync(w => w.Id == change.PlannedWorkoutId);
-                Assert.True(after.TargetDistanceKm < before[after.Id].TargetDistanceKm, "fatigue changes only reduce load");
-                Assert.False(after.Type.IsQuality());
-            }
-
-            var push = await s.GetRequiredService<CorosPushService>().PushUpcomingAsync(athlete, default);
-            Assert.True(push.Updated >= 1);
+            var change = await scope.Db().PlanChanges.SingleAsync(c => c.RecommendationId == proposed.Id);
+            Assert.Equal(12, (await scope.Db().PlannedWorkouts.SingleAsync(w => w.Id == change.PlannedWorkoutId)).TargetDistanceKm);
+            Assert.True((await s.GetRequiredService<CorosPushService>().PushUpcomingAsync(athlete, default)).Updated >= 1);
         }
 
-        // 4. A minor change is auto-applied and can be undone from the audit trail.
+        // 4. The change applied at once can be undone from the audit trail.
         await using (var scope = sp.CreateAsyncScope())
         {
             var s = scope.ServiceProvider;
             var athlete = await scope.Db().Athletes.SingleAsync();
-            var plan = await scope.Db().TrainingPlans.Include(p => p.Workouts).SingleAsync(p => p.Id == planId);
-            var target = plan.Workouts.Where(w => w.Status == WorkoutStatus.Planned && w.Type == WorkoutType.Easy && w.Date > new DateOnly(2026, 11, 2))
-                .OrderBy(w => w.Date).First();
-            var today = target.Date.AddDays(-1);
-            var change = new ProposedChange(target.Id, target.Date, ChangeAction.ReduceDistance, target.Type, target.Type, target.TargetDistanceKm,
-                Math.Floor(target.TargetDistanceKm * 0.8 * 2) / 2);
-            var recommendations = s.GetRequiredService<RecommendationService>();
-
-            var minor = Assert.Single(await recommendations.CreateAsync(athlete, plan, [change], [], null, "test", "s", null, today, default));
-            Assert.Equal(RecommendationStatus.AutoApplied, minor.Status);
-            Assert.Equal(change.ToKm, target.TargetDistanceKm);
-
-            Assert.Equal(DecisionOutcome.Done, await recommendations.UndoAsync(athlete, minor.Id, default));
-            var restored = await scope.Db().PlannedWorkouts.AsNoTracking().SingleAsync(w => w.Id == target.Id);
-            Assert.Equal(change.FromKm, restored.TargetDistanceKm);
+            Assert.Equal(DecisionOutcome.Done, await s.GetRequiredService<RecommendationService>().UndoAsync(athlete, applied.Id, default));
+            var thursday = await scope.Db().PlannedWorkouts.AsNoTracking().SingleAsync(w => w.PlanId == planId && w.Date == new DateOnly(2026, 10, 29));
+            Assert.Equal((WorkoutType.Tempo, 8.0), (thursday.Type, thursday.TargetDistanceKm));
         }
 
         // 5. A red-flag symptom pauses the plan immediately; COROS pushes stop; resume needs confirmation.
@@ -313,7 +318,7 @@ public class EndToEndTests(PostgresFixture pg)
     }
 
     [Fact]
-    public async Task Unanswered_major_proposals_expire_and_leave_the_plan_unchanged()
+    public async Task Unanswered_proposals_expire_and_leave_the_plan_unchanged()
     {
         var time = new FakeTimeProvider(Start);
         await using var sp = TestHost.Build(await pg.CreateDatabaseAsync(), time, new CapturingNotifier());
@@ -326,10 +331,10 @@ public class EndToEndTests(PostgresFixture pg)
         var plan = (await s.GetRequiredService<PlanService>().GenerateAsync(athlete, default)).Plan!;
         await s.GetRequiredService<PlanService>().ApproveAsync(athlete.Id, plan.Id, default);
 
-        var targets = plan.Workouts.Where(w => w.Type == WorkoutType.Easy).Take(2).ToList();
-        var changes = targets.Select(w => new ProposedChange(w.Id, w.Date, ChangeAction.ReduceDistance, w.Type, w.Type, w.TargetDistanceKm, w.TargetDistanceKm - 1)).ToList();
+        var changes = plan.Workouts.Where(w => w.Type == WorkoutType.Easy).Take(2)
+            .Select(w => new MappedChange(w, PlanAdjuster.State(w) with { Km = w.TargetDistanceKm - 1 }, "test", NeedsApproval: true)).ToList();
         var recommendations = s.GetRequiredService<RecommendationService>();
-        var rec = Assert.Single(await recommendations.CreateAsync(athlete, plan, changes, [], null, "test", "s", null, new DateOnly(2026, 10, 25), default));
+        var rec = Assert.Single(await recommendations.CreateAsync(athlete, plan, changes, "test", "s", null, default));
         Assert.Equal(RecommendationStatus.Proposed, rec.Status);
 
         time.Advance(TimeSpan.FromHours(49));
@@ -338,13 +343,12 @@ public class EndToEndTests(PostgresFixture pg)
         Assert.Equal(0, await scope.Db().PlanChanges.CountAsync());
     }
 
-    [Theory]
-    [InlineData("missing_hrv")]
-    [InlineData("sparse_history")]
-    public async Task Missing_data_lowers_confidence_and_warns_but_still_works(string scenario)
+    [Fact]
+    public async Task A_short_history_still_gets_a_plan_and_the_coach_sees_it()
     {
         var time = new FakeTimeProvider(Start);
-        await using var sp = TestHost.Build(await pg.CreateDatabaseAsync(), time, new CapturingNotifier(), scenario);
+        var llm = new ScriptedLlm();
+        await using var sp = TestHost.Build(await pg.CreateDatabaseAsync(), time, new CapturingNotifier(), "sparse_history", llm);
         await using var scope = sp.CreateAsyncScope();
         var s = scope.ServiceProvider;
         var athletes = s.GetRequiredService<AthleteService>();
@@ -352,20 +356,12 @@ public class EndToEndTests(PostgresFixture pg)
         await athletes.SetGoalAsync(athlete.Id, new DateOnly(2027, 3, 7), null, "M", 42.195, default);
         await s.GetRequiredService<SyncService>().SyncAsync(athlete, 56, 35, default);
 
-        var readiness = await s.GetRequiredService<ReadinessService>().EvaluateAsync(athlete, new DateOnly(2026, 10, 21), default);
-        var result = await s.GetRequiredService<PlanService>().GenerateAsync(athlete, default);
+        var plan = (await s.GetRequiredService<PlanService>().GenerateAsync(athlete, default)).Plan!;
 
-        if (scenario == "missing_hrv")
-        {
-            Assert.Contains("hrv", readiness.Today.Missing);
-            Assert.Contains("sleep", readiness.Today.Missing);
-            Assert.NotEqual(Confidence.High, readiness.Today.Confidence);
-            Assert.NotNull(result.Plan);
-        }
-        else
-        {
-            Assert.Contains("plan.warn_little_history", result.Warnings);
-            Assert.NotEqual(ZoneBasis.CorosThreshold, CoachJson.Deserialize<PlanSnapshot>(result.Plan!.InputsJson)!.Zones.Basis);
-        }
+        var snapshot = PlanSnapshot.Of(plan)!;
+        Assert.True(snapshot.WeeksOfHistory < 4);
+        Assert.Null(snapshot.Vo2Max);
+        var fitness = ScriptedLlm.Context(llm.Requests.Single(r => r.Purpose == "athlete_assessment"))["fitness"]!;
+        Assert.Equal(snapshot.WeeksOfHistory, fitness["weeks_of_history"]!.GetValue<int>());
     }
 }

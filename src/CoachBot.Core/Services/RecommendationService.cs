@@ -1,8 +1,6 @@
 using CoachBot.Core.Abstractions;
-using CoachBot.Core.Analysis;
 using CoachBot.Core.Domain;
 using CoachBot.Core.Planning;
-using CoachBot.Core.Safety;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -19,76 +17,69 @@ public enum DecisionOutcome
 }
 
 /// <summary>
-/// Owns every change to an approved plan: validation, minor/major classification, applying, undo and expiry.
-/// All changes are written to the <see cref="PlanChange"/> audit trail.
+/// Owns every change to an approved plan: storing the LLM's changes, applying, approval, undo and expiry. Whether a
+/// change waits for the athlete is the LLM's call. All changes are written to the <see cref="PlanChange"/> audit trail.
 /// </summary>
 public sealed class RecommendationService(
     ICoachDb db,
     MessageFormatter fmt,
-    IOptions<SafetyOptions> safety,
+    IOptions<CoachOptions> coach,
     TimeProvider time,
     ILogger<RecommendationService> logger)
 {
-    private readonly ChangeClassifier _classifier = new(safety.Value);
-
     /// <summary>
-    /// Validates and stores the changes coming out of a run analysis. Up to two recommendations are created:
-    /// easing changes (rules + LLM reductions/swaps; minor ones are applied immediately) and LLM progression
-    /// (always major, so it waits for the athlete's approval).
+    /// Stores the LLM's changes (already through the integrity gate). Those it marked as not needing approval are applied
+    /// at once and can be undone; the others wait for the athlete. Up to two recommendations are created.
     /// </summary>
     public async Task<IReadOnlyList<Recommendation>> CreateAsync(
-        Athlete athlete, TrainingPlan plan, IReadOnlyList<ProposedChange> ruleChanges, IReadOnlyList<ProposedChange> llmChanges,
-        ReadinessAssessment? readiness, string trigger, string summary, Guid? analysisId, DateOnly today, CancellationToken ct)
+        Athlete athlete, TrainingPlan plan, IReadOnlyList<MappedChange> changes, string trigger, string summary, Guid? analysisId, CancellationToken ct)
     {
-        var zones = Zones(plan);
-        var byId = plan.Workouts.ToDictionary(w => w.Id);
-        var (easing, progression) = AdaptationEngine.MergeLlmProposals(ruleChanges, llmChanges, byId, today, readiness);
+        var now = time.GetUtcNow();
         var created = new List<Recommendation>();
+        var auto = changes.Where(c => !c.NeedsApproval).Select(c => ToStored(athlete.Language, c)).ToList();
+        var proposed = changes.Where(c => c.NeedsApproval).Select(c => ToStored(athlete.Language, c)).ToList();
 
-        if (!IsValid(plan, easing, zones, out var violations))
+        if (auto.Count > 0)
         {
-            logger.LogWarning("Merged easing changes rejected by validator ({Violations}); using rule-based changes only",
-                string.Join(", ", violations.Select(v => v.Code)));
-            easing = IsValid(plan, ruleChanges, zones, out violations) ? ruleChanges : [];
-            if (easing.Count == 0 && ruleChanges.Count > 0)
-            {
-                logger.LogWarning("Rule-based changes rejected by validator: {Violations}", string.Join(", ", violations.Select(v => v.Code)));
-            }
+            var rec = New(athlete, plan, trigger, summary, analysisId, auto, ChangeMagnitude.Minor, RecommendationStatus.AutoApplied, now);
+            rec.DecidedAt = now;
+            Apply(plan, rec, auto, "auto");
+            created.Add(rec);
         }
 
-        if (easing.Count > 0)
+        if (proposed.Count > 0)
         {
-            created.Add(Store(athlete, plan, easing, trigger, summary, analysisId, today, zones));
+            created.Add(New(athlete, plan, trigger, summary, analysisId, proposed, ChangeMagnitude.Major, RecommendationStatus.Proposed, now));
         }
 
-        if (progression.Count > 0)
+        if (created.Count > 0)
         {
-            if (IsValid(plan, progression, zones, out violations))
-            {
-                created.Add(Store(athlete, plan, progression, "llm_progression", fmt.T(athlete.Language, "adapt.llm_progression"), analysisId, today, zones));
-            }
-            else
-            {
-                logger.LogInformation("LLM progression proposal rejected by validator: {Violations}", string.Join(", ", violations.Select(v => v.Code)));
-            }
+            await db.SaveChangesAsync(ct);
         }
 
-        await db.SaveChangesAsync(ct);
         foreach (var rec in created)
         {
-            logger.LogInformation("Recommendation {Id} ({Trigger}, {Magnitude}, {Count} changes) {Status}", rec.Id, rec.Trigger, rec.Magnitude,
-                CoachJson.Deserialize<List<ProposedChange>>(rec.ChangesJson)?.Count, rec.Status);
+            logger.LogInformation("Recommendation {Id} ({Trigger}, {Status}, {Count} changes)", rec.Id, rec.Trigger, rec.Status,
+                rec.Status == RecommendationStatus.AutoApplied ? auto.Count : proposed.Count);
         }
 
         return created;
     }
 
-    private Recommendation Store(
-        Athlete athlete, TrainingPlan plan, IReadOnlyList<ProposedChange> changes, string trigger, string summary, Guid? analysisId,
-        DateOnly today, TrainingZones zones)
+    /// <summary>The change as shown to the athlete: the workout before, and after with its texts composed.</summary>
+    private WorkoutChange ToStored(string lang, MappedChange c)
     {
-        var magnitude = _classifier.Classify(changes, today, plan.Workouts.ToDictionary(w => w.Id));
-        var now = time.GetUtcNow();
+        var preview = PlanAdjuster.Clone(c.Target);
+        PlanAdjuster.Restore(preview, c.After);
+        fmt.ComposeTexts(lang, preview, c.After.Title, c.After.Description);
+        return new WorkoutChange(c.Target.Id, PlanAdjuster.State(c.Target), PlanAdjuster.State(preview),
+            string.IsNullOrWhiteSpace(c.Reason) ? null : c.Reason.Trim(), c.NeedsApproval);
+    }
+
+    private Recommendation New(
+        Athlete athlete, TrainingPlan plan, string trigger, string summary, Guid? analysisId, IReadOnlyList<WorkoutChange> changes,
+        ChangeMagnitude magnitude, RecommendationStatus status, DateTimeOffset now)
+    {
         var rec = new Recommendation
         {
             AthleteId = athlete.Id,
@@ -98,18 +89,11 @@ public sealed class RecommendationService(
             Summary = summary,
             ChangesJson = CoachJson.Serialize(changes),
             Magnitude = magnitude,
-            Status = magnitude == ChangeMagnitude.Minor ? RecommendationStatus.AutoApplied : RecommendationStatus.Proposed,
+            Status = status,
             CreatedAt = now,
-            ExpiresAt = now.AddHours(safety.Value.ApprovalExpiryHours),
+            ExpiresAt = now.AddHours(coach.Value.ApprovalExpiryHours),
         };
         db.Recommendations.Add(rec);
-
-        if (magnitude == ChangeMagnitude.Minor)
-        {
-            Apply(athlete, plan, rec, changes, zones, "auto");
-            rec.DecidedAt = now;
-        }
-
         return rec;
     }
 
@@ -135,14 +119,11 @@ public sealed class RecommendationService(
         }
 
         var plan = await db.TrainingPlans.Include(p => p.Workouts).FirstAsync(p => p.Id == rec.PlanId, ct);
-        var changes = CoachJson.Deserialize<List<ProposedChange>>(rec.ChangesJson) ?? [];
-        var zones = Zones(plan);
+        var changes = Changes(rec);
 
-        // The plan may have changed since the proposal (other changes, completed workouts): re-check before applying.
-        var stillPlanned = changes.All(c => plan.Workouts.Any(w => w.Id == c.WorkoutId && w.Status == WorkoutStatus.Planned));
-        var increases = changes.Any(IsIncrease);
-        if (!stillPlanned || plan.Status is not (PlanStatus.Active or PlanStatus.Paused) || (increases && plan.Status == PlanStatus.Paused)
-            || !IsValid(plan, changes, zones, out _))
+        // Apply exactly what the athlete was shown: if a workout changed since (completed, missed, another change), or
+        // the change would now put two sessions on one day, the proposal no longer fits.
+        if (changes.Count == 0 || plan.Status is not (PlanStatus.Active or PlanStatus.Paused) || !StillFits(plan, changes))
         {
             rec.Status = RecommendationStatus.Expired;
             rec.DecidedAt = now;
@@ -150,11 +131,29 @@ public sealed class RecommendationService(
             return (DecisionOutcome.NoLongerValid, rec);
         }
 
-        Apply(athlete, plan, rec, changes, zones, "athlete");
+        Apply(plan, rec, changes, "athlete");
         rec.Status = RecommendationStatus.Approved;
         rec.DecidedAt = now;
         await db.SaveChangesAsync(ct);
         return (DecisionOutcome.Done, rec);
+    }
+
+    private static bool StillFits(TrainingPlan plan, IReadOnlyList<WorkoutChange> changes)
+    {
+        foreach (var c in changes)
+        {
+            if (plan.Workouts.FirstOrDefault(w => w.Id == c.WorkoutId) is not { Status: WorkoutStatus.Planned } w || PlanAdjuster.State(w) != c.Before)
+            {
+                return false;
+            }
+        }
+
+        var after = changes.ToDictionary(c => c.WorkoutId, c => c.After);
+        return !plan.Workouts
+            .Select(w => after.TryGetValue(w.Id, out var a) ? (w.Id, a.Date, a.Type) : (w.Id, w.Date, w.Type))
+            .Where(s => s.Type != WorkoutType.Rest)
+            .GroupBy(s => s.Date)
+            .Any(g => g.Count() > 1 && g.Any(s => after.ContainsKey(s.Id)));
     }
 
     public async Task<DecisionOutcome> RejectAsync(Athlete athlete, Guid recId, CancellationToken ct)
@@ -176,7 +175,7 @@ public sealed class RecommendationService(
         return DecisionOutcome.Done;
     }
 
-    /// <summary>Reverts an auto-applied (minor) change using the audit trail snapshots.</summary>
+    /// <summary>Reverts an auto-applied change using the audit trail snapshots.</summary>
     public async Task<DecisionOutcome> UndoAsync(Athlete athlete, Guid recId, CancellationToken ct)
     {
         var rec = await db.Recommendations.FirstOrDefaultAsync(r => r.Id == recId && r.AthleteId == athlete.Id, ct);
@@ -230,7 +229,7 @@ public sealed class RecommendationService(
         return DecisionOutcome.Done;
     }
 
-    /// <summary>Major proposals that were not answered in time expire; the plan stays as it was.</summary>
+    /// <summary>Proposals that were not answered in time expire; the plan stays as it was.</summary>
     public async Task<IReadOnlyList<Recommendation>> ExpireDueAsync(CancellationToken ct)
     {
         var now = time.GetUtcNow();
@@ -248,41 +247,36 @@ public sealed class RecommendationService(
     public OutboundMessage Render(Athlete athlete, Recommendation rec)
     {
         var lang = athlete.Language;
-        var changes = CoachJson.Deserialize<List<ProposedChange>>(rec.ChangesJson) ?? [];
-        var lines = string.Join("\n", changes.Select(c => "• " + fmt.ChangeLine(lang, c)));
+        var lines = string.Join("\n", Changes(rec).Select(c => "• " + fmt.ChangeLine(lang, c)));
         if (rec.Status == RecommendationStatus.AutoApplied)
         {
             return new OutboundMessage($"{fmt.T(lang, "rec.auto_applied_header")}\n{lines}",
                 [[new MessageButton(fmt.T(lang, "button.undo"), $"rec:undo:{rec.Id}")]]);
         }
 
-        return new OutboundMessage($"{fmt.T(lang, "rec.proposed_header")}\n{lines}\n{fmt.T(lang, "rec.expires_hint", safety.Value.ApprovalExpiryHours)}",
+        return new OutboundMessage($"{fmt.T(lang, "rec.proposed_header")}\n{lines}\n{fmt.T(lang, "rec.expires_hint", coach.Value.ApprovalExpiryHours)}",
             [[new MessageButton(fmt.T(lang, "button.approve"), $"rec:approve:{rec.Id}"), new MessageButton(fmt.T(lang, "button.reject"), $"rec:reject:{rec.Id}")]]);
     }
 
-    private void Apply(Athlete athlete, TrainingPlan plan, Recommendation rec, IReadOnlyList<ProposedChange> changes, TrainingZones zones, string appliedBy)
+    /// <summary>The stored changes; rows from before changes carried full workout states have none and cannot be applied.</summary>
+    private static List<WorkoutChange> Changes(Recommendation rec) =>
+        (CoachJson.Deserialize<List<WorkoutChange>>(rec.ChangesJson) ?? []).Where(c => c.Before is not null && c.After is not null).ToList();
+
+    private void Apply(TrainingPlan plan, Recommendation rec, IReadOnlyList<WorkoutChange> changes, string appliedBy)
     {
         var now = time.GetUtcNow();
-        var before = plan.Workouts.ToDictionary(w => w.Id, PlanAdjuster.Snapshot);
-        var modified = new HashSet<PlannedWorkout>();
         foreach (var change in changes)
         {
-            foreach (var w in PlanAdjuster.Apply(plan.Workouts, change, zones))
-            {
-                modified.Add(w);
-            }
-        }
-
-        foreach (var w in modified)
-        {
-            fmt.FillTexts(athlete.Language, w);
+            var w = plan.Workouts.First(x => x.Id == change.WorkoutId);
+            var before = PlanAdjuster.Snapshot(w);
+            PlanAdjuster.Restore(w, change.After);
             w.UpdatedAt = now;
             db.PlanChanges.Add(new PlanChange
             {
                 PlanId = plan.Id,
                 PlannedWorkoutId = w.Id,
                 RecommendationId = rec.Id,
-                BeforeJson = before[w.Id],
+                BeforeJson = before,
                 AfterJson = PlanAdjuster.Snapshot(w),
                 Reason = rec.Trigger,
                 AppliedBy = appliedBy,
@@ -290,27 +284,4 @@ public sealed class RecommendationService(
             });
         }
     }
-
-    private bool IsValid(TrainingPlan plan, IReadOnlyList<ProposedChange> changes, TrainingZones zones, out IReadOnlyList<Violation> violations)
-    {
-        if (changes.Count == 0)
-        {
-            violations = [];
-            return true;
-        }
-
-        // Guidelines (session mix, spacing) are the coach's call; only enforced limits can block a change.
-        var after = PlanAdjuster.Preview(plan.Workouts, changes, zones);
-        violations = [.. new PlanValidator(safety.Value.ForRace(zones.RaceKm))
-            .ValidateAdaptation(plan.Workouts, after, zones, allowIncrease: changes.Any(IsIncrease))
-            .Where(v => !v.IsGuideline)];
-        return violations.Count == 0;
-    }
-
-    private static bool IsIncrease(ProposedChange c) =>
-        c.Action is ChangeAction.IncreaseDistance or ChangeAction.Upgrade || c.ToKm > c.FromKm
-        || c.ToType.IntensityRank() > c.FromType.IntensityRank();
-
-    internal static TrainingZones Zones(TrainingPlan plan) =>
-        CoachJson.Deserialize<PlanSnapshot>(plan.InputsJson)?.Zones ?? new TrainingZones(ZoneBasis.Rpe, null, null, null);
 }

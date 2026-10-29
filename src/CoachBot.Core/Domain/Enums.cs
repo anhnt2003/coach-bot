@@ -14,8 +14,8 @@ public enum WorkoutType
 }
 
 /// <summary>
-/// Effort of one part of a structured workout. Paces and heart-rate targets for each are derived from measured fitness
-/// (<see cref="Planning.TrainingZones"/>); the LLM only chooses the intensity.
+/// Effort of a plain run or of one part of a structured workout. The LLM sets the pace and heart-rate target for each in
+/// the plan's <see cref="Planning.PaceTable"/>.
 /// </summary>
 public enum Intensity
 {
@@ -32,7 +32,7 @@ public enum Intensity
     Strides,
 }
 
-/// <summary>Race distances the safety limits are tuned for. Other distances use the closest profile.</summary>
+/// <summary>Standard race distances. Other distances use the closest profile.</summary>
 public enum RaceProfile
 {
     FiveK,
@@ -87,17 +87,6 @@ public enum ChangeMagnitude
     Major,
 }
 
-public enum ChangeAction
-{
-    ReduceDistance,
-    Downgrade,
-    ConvertToRest,
-    SwapDays,
-    IncreaseDistance,
-    Upgrade,
-    ChangePace,
-}
-
 public enum RecommendationStatus
 {
     Proposed,
@@ -145,42 +134,9 @@ public enum SymptomCategory
 
 public static class WorkoutTypeExtensions
 {
-    /// <summary>Sessions that count as "hard" for spacing rules (no two hard days back-to-back).</summary>
-    public static bool IsHard(this WorkoutType type) =>
-        type is WorkoutType.Long or WorkoutType.Tempo or WorkoutType.Interval or WorkoutType.RacePace or WorkoutType.Race;
-
-    /// <summary>Quality sessions are the intensity workouts capped per week.</summary>
+    /// <summary>Intensity sessions, whose headline pace is that of their main set.</summary>
     public static bool IsQuality(this WorkoutType type) =>
         type is WorkoutType.Tempo or WorkoutType.Interval or WorkoutType.RacePace;
-
-    public static bool IsRun(this WorkoutType type) => type != WorkoutType.Rest;
-
-    /// <summary>
-    /// Share of a session's distance spent above easy intensity (warm-up/cool-down excluded), for sessions without a
-    /// structure. Structured sessions are measured from their steps (<see cref="Planning.WorkoutStructure"/>).
-    /// </summary>
-    public static double HardShare(this WorkoutType type) => type switch
-    {
-        WorkoutType.Tempo => 0.5,
-        WorkoutType.Interval => 0.4,
-        WorkoutType.RacePace => 0.6,
-        WorkoutType.Race => 1.0,
-        _ => 0.0,
-    };
-
-    /// <summary>Relative intensity rank used to decide whether a change is a downgrade or an upgrade.</summary>
-    public static int IntensityRank(this WorkoutType type) => type switch
-    {
-        WorkoutType.Rest => 0,
-        WorkoutType.Recovery => 1,
-        WorkoutType.Easy => 2,
-        WorkoutType.Long => 3,
-        WorkoutType.RacePace => 4,
-        WorkoutType.Tempo => 5,
-        WorkoutType.Interval => 6,
-        WorkoutType.Race => 7,
-        _ => 0,
-    };
 }
 
 public static class RaceProfiles

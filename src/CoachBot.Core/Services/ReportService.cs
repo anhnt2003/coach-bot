@@ -12,23 +12,35 @@ public sealed class ReportService(
     PlanService plans,
     AthleteService athletes,
     ReadinessService readiness,
+    RecommendationService recommendations,
     ICorosGateway gateway,
     AlertService alerts,
     CoachLlm llm,
     MessageFormatter fmt,
     TimeProvider time)
 {
+    /// <summary>Today's session and the latest readiness verdict. Answers at once: no LLM call.</summary>
     public async Task<OutboundMessage> TodayAsync(Athlete athlete, CancellationToken ct)
     {
         var lang = athlete.Language;
         var today = AthleteClock.Today(time, athlete.TimeZone);
         var plan = await plans.GetCurrentPlanAsync(athlete.Id, ct);
-        var state = await readiness.EvaluateAsync(athlete, today, ct);
+        var check = await readiness.LatestAsync(athlete.Id, ct);
 
         var sb = new StringBuilder();
         AppendPlanState(sb, lang, plan);
         AppendWorkouts(sb, lang, plan, today, today, "report.today_header");
-        AppendReadiness(sb, lang, state);
+        sb.AppendLine();
+        if (check is null)
+        {
+            sb.AppendLine(fmt.T(lang, "readiness.none"));
+        }
+        else
+        {
+            AppendReadiness(sb, lang, check.Level, check.Confidence, check.Summary, CoachJson.Deserialize<List<string>>(check.ConcernsJson) ?? [],
+                fmt.T(lang, "readiness.checked_on", fmt.Day(lang, check.Date)));
+        }
+
         return new OutboundMessage(sb.ToString().TrimEnd());
     }
 
@@ -36,7 +48,7 @@ public sealed class ReportService(
     {
         var lang = athlete.Language;
         var today = AthleteClock.Today(time, athlete.TimeZone);
-        var monday = PlanGenerator.MondayOf(today);
+        var monday = PlanCalendar.MondayOf(today);
         var plan = await plans.GetCurrentPlanAsync(athlete.Id, ct);
 
         var sb = new StringBuilder();
@@ -75,71 +87,129 @@ public sealed class ReportService(
     }
 
     /// <summary>
-    /// Morning check: readiness, today's session, fatigue alert, missed-workout bookkeeping and feedback nudges.
-    /// Returns null when there is no plan and nothing worth sending.
+    /// Morning check: the LLM judges today's readiness from the raw recovery data and may change the coming sessions.
+    /// Without a plan there is nothing to check: returns null and the LLM is not asked. Throws
+    /// <see cref="LlmException"/> when the answer is unusable; the missed-session bookkeeping is kept.
     /// </summary>
     public async Task<OutboundMessage?> DailyCheckAsync(Athlete athlete, CancellationToken ct)
     {
         var lang = athlete.Language;
         var today = AthleteClock.Today(time, athlete.TimeZone);
         var plan = await plans.GetCurrentPlanAsync(athlete.Id, ct);
-        var state = await readiness.EvaluateAsync(athlete, today, ct);
+        if (plan is null)
+        {
+            return null;
+        }
+
+        // Bookkeeping, not a decision: a session two days past with no run matched to it was missed. The coach sees
+        // these and decides whether anything moves.
+        var justMissed = plan.Workouts.Where(w => w.Status == WorkoutStatus.Planned && w.Type != WorkoutType.Rest && w.Date <= today.AddDays(-2)).ToList();
+        foreach (var w in justMissed)
+        {
+            w.Status = WorkoutStatus.Missed;
+            w.UpdatedAt = time.GetUtcNow();
+        }
+
+        if (justMissed.Count > 0)
+        {
+            await db.SaveChangesAsync(ct);
+        }
+
+        var goal = await athletes.GetActiveGoalAsync(athlete.Id, ct);
+        var snapshot = PlanSnapshot.Of(plan);
+        var paces = PlanSnapshot.PacesOf(plan);
+        var recovery = await readiness.LoadContextAsync(athlete, today, ct);
+        var window = plan.Workouts.Where(w => w.Date >= today.AddDays(-3) && w.Date <= today.AddDays(7)).OrderBy(w => w.Date).ToList();
+        var canAdapt = plan.Status == PlanStatus.Active;
+        var offered = canAdapt
+            ? window.Where(w => w.Status == WorkoutStatus.Planned && w.Type != WorkoutType.Race && w.Date >= today).Select(w => w.Id).ToHashSet()
+            : [];
+        var raceDate = goal?.RaceDate ?? plan.EndDate;
+
+        var ai = await llm.AskAsync<DailyCheckResponse>("daily_check", athlete.Id, new
+        {
+            today,
+            goal = LlmContext.Goal(goal),
+            diagnosis = snapshot?.Assessment is { } a ? new { a.Level, a.Limiters, a.Priorities, a.Risks } : null,
+            plan = new
+            {
+                status = plan.Status,
+                paces = paces.Entries,
+                sessions = window.Select(LlmContext.Session),
+                just_missed = justMissed.Select(w => w.Id),
+            },
+            changes_allowed = canAdapt,
+            daily_metrics = recovery.DailyMetrics,
+            runs = recovery.Runs,
+            feedback = recovery.Feedback,
+            recent_readiness = recovery.RecentReadiness,
+            athlete_notes = athlete.Notes,
+        }, lang, LlmSchemas.DailyCheck, ct, answer =>
+        {
+            var errors = new List<string>();
+            LlmGates.Readiness(answer.Readiness, errors);
+            if (string.IsNullOrWhiteSpace(answer.Advice))
+            {
+                errors.Add("advice_missing");
+            }
+
+            if (canAdapt)
+            {
+                errors.AddRange(WorkoutChangeMapper.Map(answer.Changes, plan, offered, paces, today, raceDate).Errors);
+            }
+
+            return errors;
+        });
+
+        var (level, confidence) = LlmGates.Readiness(ai.Readiness, []);
+        var summary = ai.Readiness!.Summary!.Trim();
+        var concerns = ai.Readiness.Concerns?.Where(c => !string.IsNullOrWhiteSpace(c)).Select(c => c.Trim()).ToList() ?? [];
+        await readiness.UpsertAsync(athlete.Id, today, level, confidence, summary, concerns, "daily_check", ct);
+        await db.SaveChangesAsync(ct);
+
+        var changes = canAdapt ? WorkoutChangeMapper.Map(ai.Changes, plan, offered, paces, today, raceDate).Changes : [];
+        IReadOnlyList<Recommendation> recs = changes.Count > 0
+            ? await recommendations.CreateAsync(athlete, plan, changes, "daily_check", fmt.T(lang, "adapt.from_daily"), null, ct)
+            : [];
+
+        if (level != ReadinessLevel.Green)
+        {
+            await alerts.RaiseAsync(athlete.Id, AlertType.Fatigue, level == ReadinessLevel.Red ? AlertSeverity.Warning : AlertSeverity.Info,
+                summary, $"fatigue:{today:yyyy-MM-dd}", ct, send: false);
+        }
 
         var sb = new StringBuilder();
         sb.AppendLine(fmt.T(lang, "daily.header", fmt.Day(lang, today)));
         AppendPlanState(sb, lang, plan);
-
-        if (plan is not null)
+        if (justMissed.Count > 0)
         {
-            // Missed sessions are recorded, never made up: piling missed volume onto later days is an injury risk.
-            var missed = plan.Workouts.Where(w => w.Status == WorkoutStatus.Planned && w.Type != WorkoutType.Rest && w.Date <= today.AddDays(-2)).ToList();
-            foreach (var w in missed)
-            {
-                w.Status = WorkoutStatus.Missed;
-                w.UpdatedAt = time.GetUtcNow();
-            }
-
-            await db.SaveChangesAsync(ct);
-            if (missed.Count > 0)
-            {
-                sb.AppendLine(fmt.T(lang, "daily.missed", missed.Count));
-            }
-
-            var unconfirmed = plan.Workouts.Where(w => w.Status == WorkoutStatus.Planned && w.Type != WorkoutType.Rest && w.Date == today.AddDays(-1)).ToList();
-            foreach (var w in unconfirmed)
-            {
-                sb.AppendLine(fmt.T(lang, "daily.unconfirmed", fmt.Line(lang, w)));
-            }
-
-            AppendWorkouts(sb, lang, plan, today, today, "report.today_header");
+            sb.AppendLine(fmt.T(lang, "daily.missed", justMissed.Count));
         }
 
-        AppendReadiness(sb, lang, state);
-
-        if (state.Today.Level == ReadinessLevel.Red)
+        foreach (var w in plan.Workouts.Where(w => w.Status == WorkoutStatus.Planned && w.Type != WorkoutType.Rest && w.Date == today.AddDays(-1)))
         {
-            await alerts.RaiseAsync(athlete.Id, AlertType.Fatigue, AlertSeverity.Warning, fmt.T(lang, "readiness.level.red"), $"fatigue:{today}", ct, send: false);
-            sb.AppendLine(fmt.T(lang, "daily.red_advice"));
+            sb.AppendLine(fmt.T(lang, "daily.unconfirmed", fmt.Line(lang, w)));
         }
 
-        if (state.Today.Missing.Count >= 3)
-        {
-            await alerts.RaiseAsync(athlete.Id, AlertType.MissingData, AlertSeverity.Info, fmt.T(lang, "daily.missing_data"), $"missing:{today}", ct, send: false);
-            sb.AppendLine(fmt.T(lang, "daily.missing_data"));
-        }
+        AppendWorkouts(sb, lang, plan, today, today, "report.today_header");
+        sb.AppendLine();
+        AppendReadiness(sb, lang, level, confidence, summary, concerns, "");
+        sb.AppendLine().AppendLine(ai.Advice!.Trim());
 
         var buttons = new List<IReadOnlyList<MessageButton>>();
+        foreach (var rec in recs)
+        {
+            var recMessage = recommendations.Render(athlete, rec);
+            sb.AppendLine().AppendLine(rec.Summary).AppendLine(recMessage.Text);
+            buttons.AddRange(recMessage.Buttons ?? []);
+        }
+
         var lastRunWithoutRpe = await LastRunWithoutRpeAsync(athlete, today, ct);
         if (lastRunWithoutRpe is not null)
         {
             sb.AppendLine().AppendLine(fmt.T(lang, "daily.ask_rpe", MessageFormatter.Km(Math.Round(lastRunWithoutRpe.DistanceKm, 1))));
             buttons.Add([.. Enumerable.Range(1, 5).Select(i => new MessageButton($"{i}", $"rpe:{lastRunWithoutRpe.Id}:{i}"))]);
             buttons.Add([.. Enumerable.Range(6, 5).Select(i => new MessageButton($"{i}", $"rpe:{lastRunWithoutRpe.Id}:{i}"))]);
-        }
-
-        if (plan is null && state.Today.Signals.Count == 0)
-        {
-            return null;
         }
 
         return new OutboundMessage(sb.ToString().TrimEnd(), buttons.Count > 0 ? buttons : null);
@@ -149,7 +219,7 @@ public sealed class ReportService(
     {
         var lang = athlete.Language;
         var today = AthleteClock.Today(time, athlete.TimeZone);
-        var monday = PlanGenerator.MondayOf(today);
+        var monday = PlanCalendar.MondayOf(today);
         var plan = await plans.GetCurrentPlanAsync(athlete.Id, ct);
 
         var since = time.GetUtcNow().AddDays(-15);
@@ -194,28 +264,19 @@ public sealed class ReportService(
         sb.AppendLine(fmt.T(lang, "weekly.sessions", stats.completed, stats.planned_sessions, stats.missed));
         sb.AppendLine(fmt.T(lang, "weekly.recovery", F(stats.hrv), F(stats.hrv_prev), F(stats.rhr), F(stats.rhr_prev), F(stats.sleep_h)));
 
-        var flags = await db.RunAnalyses.Where(r => r.AthleteId == athlete.Id && r.CreatedAt >= time.GetUtcNow().AddDays(-7)).Select(r => r.DetailsJson).ToListAsync(ct);
-        var easyTooFast = flags.Count(f => f.Contains("easy_too_fast", StringComparison.Ordinal));
-        if (easyTooFast >= 2)
-        {
-            sb.AppendLine(fmt.T(lang, "weekly.easy_too_fast", easyTooFast));
-        }
-
-        var planInputs = plan is null ? null : CoachJson.Deserialize<PlanSnapshot>(plan.InputsJson);
-        var ai = await llm.AskOrNullAsync<WeeklyReportResponse>("weekly_report", athlete.Id, new
+        var planInputs = plan is null ? null : PlanSnapshot.Of(plan);
+        var ai = await llm.AskAsync<WeeklyReportResponse>("weekly_report", athlete.Id, new
         {
             stats,
             phase = planned.FirstOrDefault()?.Phase,
-            goal_distance_km = planInputs?.Zones.RaceKm,
+            goal_distance_km = planInputs?.RaceKm,
             diagnosis = planInputs?.Assessment is { } a ? new { a.Limiters, a.Priorities } : null,
-        }, lang, LlmSchemas.WeeklyReport, ct);
-        if (ai is not null)
+            readiness_last_7_days = (await readiness.RecentAsync(athlete.Id, today.AddDays(-6), today, ct)).Select(r => new { r.Date, r.Level }),
+        }, lang, LlmSchemas.WeeklyReport, ct, r => string.IsNullOrWhiteSpace(r.Summary) ? ["summary_missing"] : []);
+        sb.AppendLine().AppendLine(ai.Summary.Trim());
+        if (!string.IsNullOrWhiteSpace(ai.FocusNextWeek))
         {
-            sb.AppendLine().AppendLine(ai.Summary);
-            if (!string.IsNullOrWhiteSpace(ai.FocusNextWeek))
-            {
-                sb.AppendLine("🎯 " + ai.FocusNextWeek);
-            }
+            sb.AppendLine("🎯 " + ai.FocusNextWeek.Trim());
         }
 
         if (plan is not null)
@@ -278,18 +339,14 @@ public sealed class ReportService(
         }
     }
 
-    private void AppendReadiness(StringBuilder sb, string lang, ReadinessHistory state)
+    private void AppendReadiness(
+        StringBuilder sb, string lang, ReadinessLevel level, Confidence confidence, string summary, IReadOnlyList<string> concerns, string checkedOn)
     {
-        sb.AppendLine().AppendLine(fmt.T(lang, $"readiness.level.{state.Today.Level.ToString().ToLowerInvariant()}")
-                                   + " " + fmt.T(lang, $"readiness.confidence.{state.Today.Confidence.ToString().ToLowerInvariant()}"));
-        foreach (var s in state.Today.Signals)
+        sb.AppendLine(fmt.ReadinessLine(lang, level, confidence) + checkedOn);
+        sb.AppendLine(summary);
+        foreach (var concern in concerns)
         {
-            sb.AppendLine(fmt.SignalLine(lang, s));
-        }
-
-        if (state.Today.Missing.Count > 0)
-        {
-            sb.AppendLine(fmt.T(lang, "readiness.missing", string.Join(", ", state.Today.Missing.Select(m => fmt.T(lang, $"readiness.signal.{m}")))));
+            sb.AppendLine("• " + concern);
         }
     }
 }

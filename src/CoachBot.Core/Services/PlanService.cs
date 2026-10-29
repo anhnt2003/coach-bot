@@ -2,14 +2,12 @@ using System.Text;
 using CoachBot.Core.Abstractions;
 using CoachBot.Core.Domain;
 using CoachBot.Core.Planning;
-using CoachBot.Core.Safety;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
-using Microsoft.Extensions.Options;
 
 namespace CoachBot.Core.Services;
 
-public sealed record PlanGenerationResult(TrainingPlan? Plan, IReadOnlyList<string> Warnings, string? FailureKey);
+public sealed record PlanGenerationResult(TrainingPlan? Plan, string? FailureKey);
 
 public sealed class PlanService(
     ICoachDb db,
@@ -17,7 +15,6 @@ public sealed class PlanService(
     ICorosGateway gateway,
     CoachLlm llm,
     MessageFormatter fmt,
-    IOptions<SafetyOptions> safety,
     TimeProvider time,
     ILogger<PlanService> logger)
 {
@@ -28,85 +25,78 @@ public sealed class PlanService(
             .OrderByDescending(p => p.Version)
             .FirstOrDefaultAsync(ct);
 
+    /// <summary>
+    /// The LLM diagnoses the athlete, then designs the whole plan: weeks, sessions, their structure and the pace table.
+    /// Code only checks that the design can be stored (<see cref="PlanDesignMapper"/>); everything else is the coach's
+    /// choice. Throws <see cref="LlmException"/> when either answer is unusable, and then nothing is stored.
+    /// </summary>
     public async Task<PlanGenerationResult> GenerateAsync(Athlete athlete, CancellationToken ct)
     {
         var goal = await athletes.GetActiveGoalAsync(athlete.Id, ct);
         if (goal is null)
         {
-            return new(null, [], "plan.no_goal");
+            return new(null, "plan.no_goal");
         }
 
         var today = AthleteClock.Today(time, athlete.TimeZone);
-        var history = await LoadHistoryAsync(athlete, today, ct);
-        var zones = PaceZoneCalculator.Calculate(new FitnessInputs(
-            history.ThresholdPace, history.MarathonPrediction, history.Efforts, goal.GoalTimeSeconds, goal.DistanceKm,
-            athlete.MaxHr, athlete.BirthYear, today.Year));
-
-        var options = safety.Value.ForRace(goal.DistanceKm);
-        var draft = new PlanGenerator(options).Generate(new PlanInputs(
-            today, goal.RaceDate, goal.DistanceKm, history.WeeklyKmAvg, history.LongestRunKm, history.WeeksOfHistory,
-            athlete.RunDaysPerWeek, athlete.LongRunDay, zones.Zones));
-
-        var warnings = draft.Warnings.Concat(zones.Warnings).Distinct().ToList();
-        if (!draft.Feasible)
+        var start = PlanCalendar.MondayAfter(today);
+        var weeks = PlanCalendar.WeeksUntil(start, goal.RaceDate);
+        if (weeks < 1)
         {
-            return new(null, warnings, warnings.LastOrDefault(w => w.StartsWith("plan.infeasible", StringComparison.Ordinal)));
-        }
-
-        var validator = new PlanValidator(options);
-        var constraints = new PlanConstraints(goal.RaceDate, Math.Clamp(athlete.RunDaysPerWeek, 3, 6));
-        var violations = validator.ValidatePlan(draft.Workouts, draft.Baseline, zones.Zones, constraints);
-        if (violations.Count > 0)
-        {
-            // The generator is tested to never do this; refuse rather than store an unsafe plan.
-            logger.LogError("Generated plan failed validation: {Violations}", string.Join("; ", violations.Select(v => v.Code)));
-            return new(null, warnings, "plan.internal_validation_failed");
+            return new(null, "plan.infeasible_race_too_soon");
         }
 
         var lang = athlete.Language;
-        IReadOnlyList<PlannedWorkout> workouts = draft.Workouts;
-        string? rationale = null;
-        IReadOnlyList<WeeklyFocus>? focus = null;
-        AthleteAssessment? assessment = null;
-        var generatedBy = "rules";
-
+        var history = await LoadHistoryAsync(athlete, today, ct);
         var notesSince = time.GetUtcNow().AddDays(-30);
         var notes = await db.Feedback.Where(f => f.AthleteId == athlete.Id && f.Notes != null && f.CreatedAt >= notesSince)
             .OrderByDescending(f => f.CreatedAt).Select(f => f.Notes!).Take(10).ToListAsync(ct);
-        assessment = await AssessAsync(athlete, goal, history, zones.Zones, draft, notes, warnings, ct);
-        var (designed, fallbackReason) = await DesignWithLlmAsync(athlete, goal, history, zones.Zones, draft, constraints, validator, options, assessment, notes, warnings, ct);
-        if (designed is not null)
-        {
-            (workouts, rationale, focus) = (designed.Workouts, designed.Rationale, designed.Focus);
-            warnings.AddRange(designed.Warnings.Except(warnings));
-            generatedBy = $"llm:{llm.ProviderName}";
-        }
-        else
-        {
-            warnings.Add(fallbackReason!);
-            var explained = await ExplainRulePlanAsync(goal, history, zones.Zones, draft, warnings, lang, ct);
-            (rationale, focus) = (explained?.Rationale, explained?.WeeklyFocus);
-        }
 
-        foreach (var w in workouts)
+        var assessment = await llm.AskAsync<AthleteAssessment>("athlete_assessment", athlete.Id, new
         {
-            // An LLM-designed session carries its own title and coaching note; keep them in front of the targets.
-            var note = w.Description;
-            var title = w.Title;
-            fmt.FillTexts(lang, w);
-            if (!string.IsNullOrWhiteSpace(title))
+            race = new { goal.Name, date = goal.RaceDate, distance_km = goal.DistanceKm, goal_time_seconds = goal.GoalTimeSeconds, weeks_to_race = weeks },
+            athlete = new
             {
-                w.Title = $"{title} · {MessageFormatter.Km(w.TargetDistanceKm)} km";
-            }
+                run_days_per_week = athlete.RunDaysPerWeek,
+                age = athlete.BirthYear is int y ? today.Year - y : (int?)null,
+                max_hr = athlete.MaxHr,
+                profile_notes = athlete.Notes,
+                recent_notes = notes,
+            },
+            fitness = history,
+        }, lang, LlmSchemas.AthleteAssessment, ct, AssessmentErrors);
 
-            if (!string.IsNullOrWhiteSpace(note))
+        var design = await llm.AskAsync<PlanDesign>("plan_design", athlete.Id, new
+        {
+            race = new
             {
-                w.Description = w.StepsJson is null ? $"{note} {fmt.Targets(lang, w)}" : $"{note}\n{w.Description}";
-            }
+                goal.Name,
+                date = goal.RaceDate,
+                weekday = goal.RaceDate.DayOfWeek.ToString().ToLowerInvariant()[..3],
+                distance_km = goal.DistanceKm,
+                goal_time_seconds = goal.GoalTimeSeconds,
+            },
+            assessment,
+            athlete = new
+            {
+                run_days_per_week = athlete.RunDaysPerWeek,
+                long_run_day = athlete.LongRunDay.ToString().ToLowerInvariant()[..3],
+                profile_notes = athlete.Notes,
+                recent_notes = notes,
+            },
+            fitness = history,
+            plan_window = new { first_monday = start, weeks, race_week = weeks },
+        }, lang, LlmSchemas.PlanDesign, ct, d => PlanDesignMapper.Map(d, start, goal.RaceDate, goal.DistanceKm).Errors);
+
+        var mapped = PlanDesignMapper.Map(design, start, goal.RaceDate, goal.DistanceKm);
+        foreach (var w in mapped.Workouts)
+        {
+            fmt.ComposeTexts(lang, w, w.Title, w.Description);
         }
 
-        var snapshot = new PlanSnapshot(zones.Zones, draft.Baseline, history.WeeklyKmAvg, history.LongestRunKm, history.WeeksOfHistory, history.Vo2Max,
-            Assessment: assessment);
+        var focus = (design.Weeks ?? []).Where(w => !string.IsNullOrWhiteSpace(w.Focus)).Select(w => new WeeklyFocus(w.Week, w.Focus!)).ToList();
+        var snapshot = new PlanSnapshot(mapped.Paces, goal.DistanceKm, history.WeeklyKmLast4WeeksAvg, history.LongestRunLast4WeeksKm,
+            history.WeeksOfHistory, history.Vo2Max, focus, assessment);
 
         var previous = await db.TrainingPlans.Where(p => p.AthleteId == athlete.Id).MaxAsync(p => (int?)p.Version, ct) ?? 0;
         foreach (var pending in await db.TrainingPlans.Where(p => p.AthleteId == athlete.Id && p.Status == PlanStatus.PendingApproval).ToListAsync(ct))
@@ -120,15 +110,15 @@ public sealed class PlanService(
             RaceGoalId = goal.Id,
             Version = previous + 1,
             Status = PlanStatus.PendingApproval,
-            StartDate = draft.StartDate,
-            EndDate = draft.EndDate,
-            GeneratedBy = generatedBy,
-            Rationale = rationale,
-            WarningsJson = CoachJson.Serialize(warnings),
-            InputsJson = CoachJson.Serialize(snapshot with { WeeklyFocus = focus }),
+            StartDate = start,
+            EndDate = goal.RaceDate,
+            GeneratedBy = $"llm:{llm.ProviderName}",
+            Rationale = design.Rationale,
+            WarningsJson = "[]",
+            InputsJson = CoachJson.Serialize(snapshot),
             CreatedAt = time.GetUtcNow(),
         };
-        foreach (var w in workouts)
+        foreach (var w in mapped.Workouts)
         {
             w.PlanId = plan.Id;
             w.UpdatedAt = time.GetUtcNow();
@@ -137,230 +127,26 @@ public sealed class PlanService(
 
         db.TrainingPlans.Add(plan);
         await db.SaveChangesAsync(ct);
-        logger.LogInformation("Plan v{Version} generated by {GeneratedBy} ({Workouts} workouts, {Weeks} weeks)", plan.Version, generatedBy,
-            plan.Workouts.Count, plan.Workouts.Max(w => w.WeekIndex) + 1);
-        return new(plan, warnings, null);
+        logger.LogInformation("Plan v{Version} designed by {GeneratedBy} ({Workouts} workouts, {Weeks} weeks)", plan.Version, plan.GeneratedBy,
+            plan.Workouts.Count, weeks);
+        return new(plan, null);
     }
 
-    private sealed record DesignedPlan(
-        IReadOnlyList<PlannedWorkout> Workouts, string? Rationale, IReadOnlyList<WeeklyFocus> Focus, IReadOnlyList<string> Warnings);
-
-    /// <summary>
-    /// Asks the LLM to design the plan, using the rule-based draft as a safe reference. Only the validator's enforced
-    /// limits (data integrity, injury ceilings) can stop a design; guidelines it goes beyond become warnings. On enforced
-    /// violations the LLM gets one chance to repair it, and whatever still breaks a limit after that is clamped week by
-    /// week. Without a design the caller keeps the rule-based plan and shows the reason: "plan.llm_unavailable" (no usable
-    /// answer: timeout, provider error, malformed output) or "plan.llm_rejected" (the design could not be clamped).
-    /// </summary>
-    private async Task<(DesignedPlan? Plan, string? FallbackReason)> DesignWithLlmAsync(
-        Athlete athlete, RaceGoal goal, History history, TrainingZones zones, PlanDraft draft, PlanConstraints constraints,
-        PlanValidator validator, SafetyOptions o, AthleteAssessment? assessment, IReadOnlyList<string> notes, IReadOnlyList<string> warnings,
-        CancellationToken ct)
+    private static IReadOnlyList<string> AssessmentErrors(AthleteAssessment a)
     {
-        var context = new
+        var errors = new List<string>();
+        if (string.IsNullOrWhiteSpace(a.Summary))
         {
-            race = new
-            {
-                goal.Name,
-                date = goal.RaceDate,
-                distance_km = goal.DistanceKm,
-                goal_time_seconds = goal.GoalTimeSeconds,
-                predicted_time_seconds_from_current_fitness = PaceZoneCalculator.PredictedRaceSeconds(zones),
-            },
-            assessment,
-            athlete = new
-            {
-                run_days_per_week = constraints.RunDaysPerWeek,
-                long_run_day = athlete.LongRunDay.ToString().ToLowerInvariant()[..3],
-                profile_notes = athlete.Notes,
-                recent_notes = notes,
-            },
-            fitness = new
-            {
-                weekly_km_last_4_weeks_avg = history.WeeklyKmAvg,
-                weekly_km_history_oldest_first = history.WeeklyKm,
-                longest_run_last_4_weeks_km = history.LongestRunKm,
-                vo2max = history.Vo2Max,
-                zones_basis = zones.Basis,
-                warnings,
-            },
-            plan_window = new
-            {
-                first_monday = draft.StartDate,
-                weeks = draft.Workouts.Max(w => w.WeekIndex) + 1,
-                race_week = draft.Workouts.Max(w => w.WeekIndex) + 1,
-            },
-            // Enforced: a design that breaks these is repaired, then clamped.
-            limits = new
-            {
-                weekly_increase_max = $"min({o.MaxWeeklyIncreasePct:P0}, +{o.MaxWeeklyIncreaseKm} km) over the previous full (non-cutback, non-taper) week; week 1 at most {draft.Baseline.WeeklyKm} km",
-                cutback = "a week marked cutback=true must not be bigger than the previous full week",
-                long_run = $"<= {o.LongRunCapKm} km and <= {o.LongRunCapMinutes} min, +{o.LongRunMaxIncreaseKm} km/week max; week 1 at most {draft.Baseline.LongRunKm} km",
-                taper = $"taper weeks marked phase=taper (the baseline's are a safe choice), each lower than the previous and <= 85% of peak; race week <= {o.RaceWeekMaxShare:P0} of peak"
-                    + (draft.Workouts.Max(w => w.WeekIndex) >= 7 ? $", the week before it <= {o.PreRaceWeekMaxShare:P0} of peak" : ""),
-                easy_sessions = "recovery and easy runs contain only recovery/easy running, plus strides of <= 30 s or 200 m on easy runs",
-                steps = $"repeat 1..{WorkoutStructure.MaxRepeat}; recoveries at recovery, easy or steady; the steps make up the session distance",
-                run_days = $"at most {constraints.RunDaysPerWeek} run days per week, one session per day",
-                min_run_km = PlanValidator.MinRunKm,
-                race = $"one session type=race on {goal.RaceDate:yyyy-MM-dd} ({goal.RaceDate.DayOfWeek}), nothing after it",
-            },
-            // Advisory: sound defaults from coaching practice. Going beyond one is allowed when it serves this athlete.
-            guidelines = new
-            {
-                cutback_rhythm = $"every {o.CutbackEveryWeeks}th week about {1 - o.CutbackFactor:P0} lower",
-                long_run_share = $"<= {o.LongRunHardMaxShare:P0} of the week",
-                quality = $"tempo/interval/race_pace: <= {o.MaxQualityPerWeekBase} per week in base phase, <= {o.MaxQualityPerWeek} otherwise",
-                easy_share = $">= {o.MinEasyShare:P0} of weekly km easy. Sessions with steps count their steps (steady 50%, marathon pace and faster 100%); without steps tempo counts 50% hard, interval 40%, race_pace 60%",
-                intensity_per_session = new
-                {
-                    threshold_and_ten_k = Cap(o.ThresholdCap),
-                    five_k_and_hill = Cap(o.Vo2Cap),
-                    repetition_and_strides = Cap(o.RepetitionCap),
-                    marathon_and_half_marathon = Cap(o.RacePaceCap),
-                },
-                session_intensities = new
-                {
-                    @long = "recovery, easy, steady, marathon, half_marathon",
-                    tempo = "half_marathon, threshold or ten_k work; may add steady/marathon and strides",
-                    interval = "ten_k, five_k, repetition or hill work",
-                    race_pace = $"work at {PlanDesignMapper.IntensityName(zones.RaceIntensity)} (the goal race pace)",
-                    strides = $"at most {WorkoutStructure.MaxStrides} per session",
-                },
-                spacing = "no hard days back-to-back (long, tempo, interval, race_pace, race), also across weeks; no hard session in the 2 days before the race",
-            },
-            baseline_plan = PlanDesignMapper.ToDesign(draft.Workouts),
-        };
-
-        var design = await llm.AskOrNullAsync<PlanDesign>("plan_design", athlete.Id, context, athlete.Language, LlmSchemas.PlanDesign, ct);
-        if (design is null)
-        {
-            return (null, "plan.llm_unavailable");
+            errors.Add("assessment_summary_missing");
         }
 
-        (List<PlannedWorkout> Workouts, List<Violation> Errors, List<Violation> Violations) Check(PlanDesign d)
+        if (a.PredictedRaceSeconds is < 0 or > 0 and < 300 or > 100_000)
         {
-            var (mapped, errors) = PlanDesignMapper.Map(d, draft.StartDate, goal.RaceDate, goal.DistanceKm, zones);
-            return (mapped, errors, [.. errors, .. validator.ValidatePlan(mapped, draft.Baseline, zones, constraints)]);
+            errors.Add($"predicted_race_seconds_invalid: {a.PredictedRaceSeconds}; seconds, or 0 when the data is too thin");
         }
 
-        static string Describe(IEnumerable<Violation> violations) =>
-            string.Join("; ", violations.Take(15).Select(v => $"{v.Code} w{v.WeekIndex + 1} {v.Detail}"));
-
-        var (workouts, designErrors, violations) = Check(design);
-        if (violations.Any(v => !v.IsGuideline))
-        {
-            logger.LogWarning("LLM plan design broke enforced limits: {Violations}", Describe(violations.Where(v => !v.IsGuideline)));
-            var repaired = await llm.AskOrNullAsync<PlanDesign>("plan_design_repair", athlete.Id, new
-            {
-                previous_design = design,
-                violations = violations.Where(v => !v.IsGuideline).Select(v => new { v.Code, week = v.WeekIndex + 1, v.Date, v.Detail }),
-                guidelines_exceeded = violations.Where(v => v.IsGuideline).Select(v => new { v.Code, week = v.WeekIndex + 1, v.Date, v.Detail }),
-                context,
-            }, athlete.Language, LlmSchemas.PlanDesign, ct);
-            if (repaired is not null)
-            {
-                design = repaired;
-                (workouts, designErrors, violations) = Check(repaired);
-            }
-        }
-
-        IReadOnlyList<int> clamped = [], replaced = [];
-        if (violations.Any(v => !v.IsGuideline))
-        {
-            var result = PlanClamp.Apply(workouts, designErrors, draft, validator, zones, constraints);
-            if (result is null)
-            {
-                logger.LogWarning("LLM plan design could not be clamped to the limits: {Violations}", Describe(violations.Where(v => !v.IsGuideline)));
-                return (null, "plan.llm_rejected");
-            }
-
-            (workouts, clamped, replaced) = (result.Workouts, result.ClampedWeeks, result.ReplacedWeeks);
-            violations = [.. validator.ValidatePlan(workouts, draft.Baseline, zones, constraints)];
-            logger.LogInformation("LLM plan design clamped: weeks {Clamped} cut to the limits, weeks {Replaced} replaced by the baseline",
-                string.Join(",", clamped.Select(w => w + 1)), string.Join(",", replaced.Select(w => w + 1)));
-        }
-
-        var added = violations.Select(v => PlanValidator.GuidelineGroup(v.Code)).OfType<string>().Distinct().Select(g => $"plan.guideline.{g}").ToList();
-        if (added.Count > 0)
-        {
-            logger.LogInformation("LLM plan design goes beyond guidelines: {Violations}", Describe(violations));
-        }
-
-        if (clamped.Count > 0)
-        {
-            added.Add("plan.llm_clamped");
-        }
-
-        if (replaced.Count > 0)
-        {
-            added.Add("plan.llm_weeks_replaced");
-        }
-
-        var focus = (design.Weeks ?? [])
-            .Where(w => !string.IsNullOrWhiteSpace(w.Focus) && !replaced.Contains(w.Week - 1))
-            .Select(w => new WeeklyFocus(w.Week, w.Focus!))
-            .ToList();
-        return (new DesignedPlan(workouts, design.Rationale, focus, added), null);
+        return errors;
     }
-
-    private static string Cap(IntensityCap cap) => $"<= {cap.Share:P0} of the week's km per session (at least {cap.FloorKm} km allowed, never more than {cap.MaxKm} km)";
-
-    /// <summary>
-    /// The LLM's diagnosis: level, goal realism, limiters and what each phase should develop. It is advice for the plan
-    /// design and the athlete; it never changes a number by itself. Null when the LLM is unavailable.
-    /// </summary>
-    private Task<AthleteAssessment?> AssessAsync(
-        Athlete athlete, RaceGoal goal, History history, TrainingZones zones, PlanDraft draft, IReadOnlyList<string> notes,
-        IReadOnlyList<string> warnings, CancellationToken ct) =>
-        llm.AskOrNullAsync<AthleteAssessment>("athlete_assessment", athlete.Id, new
-        {
-            race = new
-            {
-                goal.Name,
-                date = goal.RaceDate,
-                distance_km = goal.DistanceKm,
-                weeks_to_race = draft.Workouts.Max(w => w.WeekIndex) + 1,
-                goal_time_seconds = goal.GoalTimeSeconds,
-                predicted_time_seconds_from_current_fitness = PaceZoneCalculator.PredictedRaceSeconds(zones),
-            },
-            athlete = new
-            {
-                run_days_per_week = athlete.RunDaysPerWeek,
-                age = athlete.BirthYear is int y ? AthleteClock.Today(time, athlete.TimeZone).Year - y : (int?)null,
-                max_hr = athlete.MaxHr,
-                profile_notes = athlete.Notes,
-                recent_notes = notes,
-            },
-            fitness = new
-            {
-                weekly_km_history_oldest_first = history.WeeklyKm,
-                weekly_km_last_4_weeks_avg = history.WeeklyKmAvg,
-                longest_run_last_4_weeks_km = history.LongestRunKm,
-                weeks_of_history = history.WeeksOfHistory,
-                recent_runs = history.RecentRuns,
-                vo2max = history.Vo2Max,
-                threshold_pace_sec_per_km = zones.ThresholdPaceSecPerKm,
-                zones_basis = zones.Basis,
-                warnings,
-            },
-        }, athlete.Language, LlmSchemas.AthleteAssessment, ct);
-
-    private Task<PlanRationaleResponse?> ExplainRulePlanAsync(
-        RaceGoal goal, History history, TrainingZones zones, PlanDraft draft, IReadOnlyList<string> warnings, string lang, CancellationToken ct) =>
-        llm.AskOrNullAsync<PlanRationaleResponse>("plan_rationale", goal.AthleteId, new
-        {
-            race = new { goal.Name, goal.RaceDate, goal.DistanceKm, goal_time = goal.GoalTimeSeconds },
-            current_fitness = new { weekly_km = history.WeeklyKmAvg, longest_run_km = history.LongestRunKm, weeks_of_history = history.WeeksOfHistory, history.Vo2Max, zones },
-            warnings,
-            weeks = draft.Workouts.GroupBy(w => w.WeekIndex).Select(g => new
-            {
-                week = g.Key + 1,
-                phase = g.First().Phase,
-                cutback = g.First().IsCutbackWeek,
-                km = g.Where(w => w.Type != WorkoutType.Race).Sum(w => w.TargetDistanceKm),
-                sessions = g.Where(w => w.Type != WorkoutType.Easy && w.Type != WorkoutType.Recovery).Select(w => $"{w.Type} {w.TargetDistanceKm}km"),
-            }),
-        }, lang, LlmSchemas.PlanRationale, ct);
 
     /// <returns>
     /// The activated plan (null if it was not pending) and the replaced plan's future workouts already on the COROS
@@ -401,37 +187,33 @@ public sealed class PlanService(
         return true;
     }
 
-    public OutboundMessage RenderProposal(Athlete athlete, TrainingPlan plan, RaceGoal goal, IReadOnlyList<string> warnings)
+    public OutboundMessage RenderProposal(Athlete athlete, TrainingPlan plan, RaceGoal goal)
     {
         var lang = athlete.Language;
         var sb = new StringBuilder();
         var weeks = plan.Workouts.GroupBy(w => w.WeekIndex).OrderBy(g => g.Key).ToList();
         var peak = weeks.Max(g => g.Where(w => w.Type != WorkoutType.Race).Sum(w => w.TargetDistanceKm));
         var longest = plan.Workouts.Where(w => w.Type == WorkoutType.Long).Select(w => w.TargetDistanceKm).DefaultIfEmpty(0).Max();
-        var snapshot = CoachJson.Deserialize<PlanSnapshot>(plan.InputsJson);
+        var snapshot = PlanSnapshot.Of(plan);
 
         var taperWeeks = weeks.Count(g => g.Any(w => w.Phase == PlanPhase.Taper));
         sb.AppendLine(fmt.T(lang, "plan.proposal_header", goal.Name, fmt.RaceDistance(lang, goal.DistanceKm), fmt.Day(lang, goal.RaceDate), weeks.Count));
         sb.AppendLine(fmt.T(lang, "plan.proposal_stats", MessageFormatter.Km(weeks[0].Where(w => w.Type != WorkoutType.Race).Sum(w => w.TargetDistanceKm)),
             MessageFormatter.Km(peak), MessageFormatter.Km(longest), taperWeeks));
-        sb.AppendLine(fmt.T(lang, plan.GeneratedBy.StartsWith("llm", StringComparison.Ordinal) ? "plan.designed_by_llm" : "plan.designed_by_rules"));
-        if (snapshot is not null)
+        sb.AppendLine(fmt.T(lang, "plan.designed_by_llm"));
+        if (snapshot?.Assessment is { } a)
         {
-            sb.AppendLine(fmt.T(lang, $"zones.basis.{snapshot.Zones.Basis}"));
-            if (PaceZoneCalculator.PredictedRaceSeconds(snapshot.Zones) is int predicted)
+            if (a.PredictedRaceSeconds is int predicted and > 0)
             {
                 sb.AppendLine(goal.GoalTimeSeconds is int goalSeconds
                     ? fmt.T(lang, "plan.prediction_goal", MessageFormatter.Time(predicted), MessageFormatter.Time(goalSeconds))
                     : fmt.T(lang, "plan.prediction", MessageFormatter.Time(predicted)));
             }
 
-            if (snapshot.Assessment is { } a)
-            {
-                sb.AppendLine().Append(RenderAssessment(lang, a));
-            }
+            sb.AppendLine().Append(RenderAssessment(lang, a));
         }
 
-        foreach (var warning in warnings)
+        foreach (var warning in CoachJson.Deserialize<List<string>>(plan.WarningsJson) ?? [])
         {
             sb.AppendLine("⚠️ " + fmt.T(lang, warning));
         }
@@ -497,12 +279,20 @@ public sealed class PlanService(
         return AssessmentLabels.Contains(key) ? fmt.T(lang, key) : value ?? "";
     }
 
+    /// <summary>Training history as the LLM sees it: raw numbers, summed and counted but never judged.</summary>
     private sealed record History(
-        double WeeklyKmAvg, double LongestRunKm, int WeeksOfHistory, IReadOnlyList<RecentEffort> Efforts,
-        int? ThresholdPace, int? MarathonPrediction, double? Vo2Max, IReadOnlyList<double> WeeklyKm, IReadOnlyList<RecentRun> RecentRuns);
+        IReadOnlyList<double> WeeklyKmOldestFirst,
+        double WeeklyKmLast4WeeksAvg,
+        double LongestRunLast4WeeksKm,
+        int WeeksOfHistory,
+        IReadOnlyList<RecentRun> RecentRuns,
+        DateOnly? CorosFitnessDate,
+        int? CorosThresholdPaceSecPerKm,
+        int? CorosMarathonPredictionSeconds,
+        double? Vo2Max);
 
-    /// <summary>A recent run as shown to the LLM for the diagnosis.</summary>
-    private sealed record RecentRun(DateOnly Date, double Km, string? Pace, int? AvgHr, string? Name);
+    /// <summary>A recent run as shown to the LLM.</summary>
+    private sealed record RecentRun(DateOnly Date, double Km, int DurationMinutes, string? Pace, int? AvgHr, string? Name);
 
     private async Task<History> LoadHistoryAsync(Athlete athlete, DateOnly today, CancellationToken ct)
     {
@@ -516,8 +306,6 @@ public sealed class PlanService(
         var weeksOfHistory = runs.Count == 0 ? 0 : Math.Min(8, (today.DayNumber - runs.Min(r => r.Date).DayNumber) / 7 + 1);
         var last4 = runs.Where(r => r.Date >= today.AddDays(-28)).ToList();
         var divisor = Math.Clamp(weeksOfHistory, 1, 4);
-        var weeklyAvg = Math.Round(last4.Sum(r => r.DistanceKm) / divisor, 1);
-        var longest = last4.Select(r => r.DistanceKm).DefaultIfEmpty(0).Max();
 
         var fitnessSince = today.AddDays(-30);
         var fitness = await db.DailyMetrics
@@ -528,10 +316,10 @@ public sealed class PlanService(
         var weeklyKm = Enumerable.Range(1, 8).Reverse()
             .Select(i => Math.Round(runs.Where(r => r.Date >= today.AddDays(-7 * i) && r.Date < today.AddDays(-7 * (i - 1))).Sum(r => r.DistanceKm), 1))
             .ToList();
-        return new History(weeklyAvg, Math.Round(longest, 1), weeksOfHistory,
-            [.. runs.Select(r => new RecentEffort(r.DistanceKm, r.DurationSeconds))],
-            fitness?.ThresholdPaceSecPerKm, fitness?.MarathonPredictionSeconds, fitness?.Vo2Max, weeklyKm,
-            [.. runs.Where(r => r.Date >= today.AddDays(-28)).OrderByDescending(r => r.Date).Take(20)
-                .Select(r => new RecentRun(r.Date, Math.Round(r.DistanceKm, 1), r.AvgPaceSecPerKm is int p ? MessageFormatter.Pace(p) : null, r.AvgHr, r.Name))]);
+        return new History(weeklyKm, Math.Round(last4.Sum(r => r.DistanceKm) / divisor, 1), Math.Round(last4.Select(r => r.DistanceKm).DefaultIfEmpty(0).Max(), 1),
+            weeksOfHistory,
+            [.. last4.OrderByDescending(r => r.Date).Take(20)
+                .Select(r => new RecentRun(r.Date, Math.Round(r.DistanceKm, 1), r.DurationSeconds / 60, r.AvgPaceSecPerKm is int p ? MessageFormatter.Pace(p) : null, r.AvgHr, r.Name))],
+            fitness?.Date, fitness?.ThresholdPaceSecPerKm, fitness?.MarathonPredictionSeconds, fitness?.Vo2Max);
     }
 }

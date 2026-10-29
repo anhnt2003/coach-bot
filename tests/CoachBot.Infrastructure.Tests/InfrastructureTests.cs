@@ -77,24 +77,21 @@ public class LocalizationTests
     {
         var root = RepoRoot();
         var source = string.Join("\n", Directory.EnumerateFiles(Path.Combine(root, "src"), "*.cs", SearchOption.AllDirectories).Select(File.ReadAllText));
-        var prefixes = new[] { "adapt.", "alert.", "analysis.", "assess.", "busy.", "button.", "change.", "common.", "connect.", "daily.", "error.", "feedback.", "goal.", "job.", "llm.", "pause.", "plan.", "profile.", "push.", "queued.", "readiness.", "rec.", "report.", "resume.", "safety.", "start.", "status.", "symptom.", "sync.", "weekly.", "work.", "workout.", "zones." };
+        var prefixes = new[] { "adapt.", "alert.", "analysis.", "assess.", "busy.", "button.", "change.", "common.", "connect.", "daily.", "error.", "feedback.", "goal.", "job.", "llm.", "pause.", "plan.", "profile.", "push.", "queued.", "readiness.", "rec.", "report.", "resume.", "safety.", "start.", "status.", "symptom.", "sync.", "weekly.", "work.", "workout." };
         var literal = Regex.Matches(source, "\"([a-z_]+\\.[a-z_.]+)\"").Select(m => m.Groups[1].Value)
             .Where(k => prefixes.Any(k.StartsWith) && !k.EndsWith('.') && k != "plan.infeasible")
             .Distinct();
 
         string[] dynamic =
         [
-            .. new[] { "easy_too_fast", "hr_above_zone", "cut_short", "long_cut_short", "ran_longer" }.Select(f => $"analysis.flag.{f}"),
             .. new[] { "pendingapproval", "active", "paused", "superseded", "rejected", "completed" }.Select(s => $"plan.status.{s}"),
             .. new[] { "no_active_plan", "plan_paused", "not_supported" }.Select(s => $"push.skipped.{s}"),
             .. new[] { "low", "medium", "high" }.Select(s => $"readiness.confidence.{s}"),
             .. new[] { "green", "amber", "red" }.Select(s => $"readiness.level.{s}"),
-            .. new[] { "hrv", "resting_hr", "sleep", "recovery", "load_ratio", "soreness", "rpe" }.Select(s => $"readiness.signal.{s}"),
             .. new[] { "approved", "rejected", "undone" }.Select(s => $"rec.{s}"),
             .. new[] { "cardiac", "injury", "illness" }.Select(s => $"safety.{s}"),
             .. Enum.GetNames<CoachBot.Core.Domain.WorkoutType>().Select(t => $"workout.type.{t.ToLowerInvariant()}"),
             .. Enum.GetNames<CoachBot.Core.Domain.WorkoutType>().Select(t => $"workout.rpe.{t.ToLowerInvariant()}"),
-            .. new[] { "coros_threshold", "coros_marathon_prediction", "estimated_from_runs", "heart_rate", "rpe" }.Select(s => $"zones.basis.{s}"),
             .. Enum.GetValues<CoachBot.Core.Domain.Intensity>().Select(i => $"intensity.{CoachBot.Core.Planning.PlanDesignMapper.IntensityName(i)}"),
             .. new[] { "5k", "10k", "half", "marathon" }.Select(d => $"race.distance.{d}"),
             .. new[] { "beginner", "intermediate", "advanced" }.Select(l => $"assess.level.{l}"),
@@ -113,13 +110,18 @@ public class LocalizationTests
     [Fact]
     public void Renders_structured_workouts_in_both_languages()
     {
-        var zones = new CoachBot.Core.Planning.TrainingZones("coros_threshold", 300, 321, 185, 21.0975, 309);
+        var paces = new CoachBot.Core.Planning.PaceTable(
+        [
+            new(CoachBot.Core.Domain.Intensity.Easy, 354, 396),
+            new(CoachBot.Core.Domain.Intensity.FiveK, 278, 290),
+            new(CoachBot.Core.Domain.Intensity.Recovery, 390, 426),
+        ], 21.0975);
         var blocks = CoachBot.Core.Planning.WorkoutStructure.Resolve(
         [
             new(1, new(CoachBot.Core.Domain.Intensity.Easy, Km: 2)),
             new(5, new(CoachBot.Core.Domain.Intensity.FiveK, Km: 1), new(CoachBot.Core.Domain.Intensity.Recovery, Minutes: 1.5)),
             new(6, new(CoachBot.Core.Domain.Intensity.Strides, Minutes: 0.33)),
-        ], zones);
+        ], paces);
         var fmt = new CoachBot.Core.Services.MessageFormatter(Catalog);
 
         Assert.Equal("2 km easy → 5 × (1 km 5K pace 4:38–4:50/km, 90 s jog) → 6 × 20 s strides (fast, relaxed)", fmt.Steps("en", blocks));
@@ -414,8 +416,11 @@ public class PromptLibraryTests
 {
     [Theory]
     [InlineData("system")]
-    [InlineData("plan_rationale")]
+    [InlineData("athlete_assessment")]
+    [InlineData("plan_design")]
     [InlineData("run_analysis")]
+    [InlineData("daily_check")]
+    [InlineData("symptom_triage")]
     [InlineData("weekly_report")]
     public void Prompts_are_embedded(string name)
     {

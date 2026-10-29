@@ -362,12 +362,11 @@ public sealed partial class TelegramUpdateHandler(
         var result = await plans.GenerateAsync(athlete, ct);
         if (result.Plan is null)
         {
-            var lines = result.Warnings.Where(w => w != result.FailureKey).Select(w => "⚠️ " + fmt.T(lang, w));
-            return new OutboundMessage(string.Join("\n", [fmt.T(lang, result.FailureKey ?? "plan.failed"), .. lines]));
+            return new OutboundMessage(fmt.T(lang, result.FailureKey ?? "plan.failed"));
         }
 
         var goal = (await sp.GetRequiredService<AthleteService>().GetActiveGoalAsync(athlete.Id, ct))!;
-        return plans.RenderProposal(athlete, result.Plan, goal, result.Warnings);
+        return plans.RenderProposal(athlete, result.Plan, goal);
     }
 
     private Task StartNoteAsync(Athlete athlete, string text, CancellationToken ct) =>

@@ -58,7 +58,7 @@ public sealed class MessageFormatter(ITextCatalog text)
         {
             WorkoutType.Tempo => T(lang, "workout.desc.tempo", Km(Math.Max(km - 4, km * 0.5))),
             WorkoutType.Interval => T(lang, "workout.desc.interval", Math.Max(3, (int)Math.Round(km * 0.4))),
-            WorkoutType.RacePace => T(lang, "workout.desc.race_pace", Km(PlanGenerator.Floor05(km * 0.6))),
+            WorkoutType.RacePace => T(lang, "workout.desc.race_pace", Km(PlanCalendar.Floor05(km * 0.6))),
             WorkoutType.Long => T(lang, "workout.desc.long"),
             WorkoutType.Recovery => T(lang, "workout.desc.recovery"),
             WorkoutType.Easy => T(lang, "workout.desc.easy"),
@@ -90,31 +90,47 @@ public sealed class MessageFormatter(ITextCatalog text)
         return showPace ? $"{amount} {label} {Pace(p.PaceFast)}–{Pace(p.PaceSlow)}/km" : $"{amount} {label}";
     }
 
-    public string Targets(string lang, PlannedWorkout w)
+    public string Targets(string lang, PlannedWorkout w) => Targets(lang, w.Type, w.PaceMinSecPerKm, w.PaceMaxSecPerKm, w.HrMin, w.HrMax);
+
+    private string Targets(string lang, WorkoutType type, int? paceMin, int? paceMax, int? hrMin, int? hrMax)
     {
         var parts = new List<string>();
-        if (w.PaceMinSecPerKm is not null)
+        if (paceMin is not null)
         {
-            parts.Add(T(lang, "workout.target.pace", Pace(w.PaceMinSecPerKm), Pace(w.PaceMaxSecPerKm)));
+            parts.Add(T(lang, "workout.target.pace", Pace(paceMin), Pace(paceMax)));
         }
 
-        if (w.HrMin is not null)
+        if (hrMin is not null)
         {
-            parts.Add(T(lang, "workout.target.hr", w.HrMin, w.HrMax));
+            parts.Add(T(lang, "workout.target.hr", hrMin, hrMax));
         }
 
         if (parts.Count == 0)
         {
-            parts.Add(T(lang, $"workout.rpe.{w.Type.ToString().ToLowerInvariant()}"));
+            parts.Add(T(lang, $"workout.rpe.{type.ToString().ToLowerInvariant()}"));
         }
 
         return string.Join(" · ", parts);
     }
 
-    public void FillTexts(string lang, PlannedWorkout w)
+    /// <summary>
+    /// Sets the athlete-facing texts of a workout the LLM designed or changed: its title and note go in front of the
+    /// templated structure and targets.
+    /// </summary>
+    public void ComposeTexts(string lang, PlannedWorkout w, string? title, string? notes)
     {
-        w.Title = Title(lang, w.Type, w.TargetDistanceKm);
-        w.Description = Description(lang, w);
+        if (w.Type == WorkoutType.Rest)
+        {
+            w.Title = TypeName(lang, w.Type);
+            w.Description = string.IsNullOrWhiteSpace(notes) ? T(lang, "workout.desc.rest") : notes.Trim();
+            return;
+        }
+
+        var templated = Description(lang, w);
+        w.Title = string.IsNullOrWhiteSpace(title) ? Title(lang, w.Type, w.TargetDistanceKm) : $"{title.Trim()} · {Km(w.TargetDistanceKm)} km";
+        w.Description = string.IsNullOrWhiteSpace(notes) ? templated
+            : w.StepsJson is null ? $"{notes.Trim()} {Targets(lang, w)}"
+            : $"{notes.Trim()}\n{templated}";
     }
 
     /// <summary>One line per workout, e.g. "Tue 21/10 · Tempo 10 km · 5:23–5:40/km".</summary>
@@ -128,25 +144,22 @@ public sealed class MessageFormatter(ITextCatalog text)
             _ => "",
         };
 
-        var title = string.IsNullOrEmpty(w.Title) ? Title(lang, w.Type, w.TargetDistanceKm) : w.Title;
-        return w.Type == WorkoutType.Rest
-            ? $"{Day(lang, w.Date)} · {title}{status}"
-            : $"{Day(lang, w.Date)} · {title} · {Targets(lang, w)}{status}";
+        return Line(lang, PlanAdjuster.State(w)) + status;
     }
 
-    public string ChangeLine(string lang, ProposedChange c) => c.Action switch
+    public string Line(string lang, WorkoutState s)
     {
-        ChangeAction.ConvertToRest => T(lang, "change.to_rest", Day(lang, c.Date), Title(lang, c.FromType, c.FromKm)),
-        ChangeAction.SwapDays => T(lang, "change.swap", Day(lang, c.Date), Day(lang, c.NewDate ?? c.Date), Title(lang, c.FromType, c.FromKm)),
-        ChangeAction.ChangePace => T(lang, "change.pace", Day(lang, c.Date), Title(lang, c.FromType, c.FromKm), Pace(c.NewPaceMinSecPerKm), Pace(c.NewPaceMaxSecPerKm)),
-        _ => T(lang, "change.modify", Day(lang, c.Date), Title(lang, c.FromType, c.FromKm), Title(lang, c.ToType, c.ToKm)),
-    };
-
-    public string SignalLine(string lang, Safety.ReadinessSignal s)
-    {
-        var icon = s.Level switch { ReadinessLevel.Red => "🔴", ReadinessLevel.Amber => "🟠", _ => "🟢" };
-        var value = s.Value?.ToString("0.##", CultureInfo.InvariantCulture) ?? "–";
-        var baseline = s.Baseline is double b ? T(lang, "readiness.baseline", b.ToString("0.#", CultureInfo.InvariantCulture)) : "";
-        return $"{icon} {T(lang, $"readiness.signal.{s.Name}")}: {value}{baseline}";
+        var title = string.IsNullOrEmpty(s.Title) ? Title(lang, s.Type, s.Km) : s.Title;
+        return s.Type == WorkoutType.Rest
+            ? $"{Day(lang, s.Date)} · {title}"
+            : $"{Day(lang, s.Date)} · {title} · {Targets(lang, s.Type, s.PaceMin, s.PaceMax, s.HrMin, s.HrMax)}";
     }
+
+    /// <summary>"Tue 27/10 · Tempo 8 km · …\n   → Tue 27/10 · Easy run 6 km · … (reason)".</summary>
+    public string ChangeLine(string lang, WorkoutChange c) =>
+        T(lang, "change.line", Line(lang, c.Before), Line(lang, c.After)) + (string.IsNullOrWhiteSpace(c.Reason) ? "" : T(lang, "change.reason", c.Reason.Trim()));
+
+    /// <summary>"🟠 Readiness: … (confidence: medium)".</summary>
+    public string ReadinessLine(string lang, ReadinessLevel level, Confidence confidence) =>
+        T(lang, $"readiness.level.{level.ToString().ToLowerInvariant()}") + " " + T(lang, $"readiness.confidence.{confidence.ToString().ToLowerInvariant()}");
 }

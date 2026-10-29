@@ -1,5 +1,7 @@
 using System.Text.Json;
 using CoachBot.Core.Abstractions;
+using CoachBot.Core.Domain;
+using CoachBot.Core.Planning;
 using Microsoft.Extensions.Logging;
 
 namespace CoachBot.Core.Services;
@@ -78,21 +80,62 @@ public sealed class CoachLlm(ILlmClient client, IPromptLibrary prompts, ILlmCall
 
 public static class LlmSchemas
 {
-    public const string PlanRationale = """
+    private const string Intensities = """["recovery", "easy", "steady", "marathon", "half_marathon", "threshold", "ten_k", "five_k", "repetition", "hill", "strides", "race_pace"]""";
+
+    private const string Part = """{ "type": "object", "properties": { "intensity": { "type": "string", "enum": """ + Intensities + """ }, "km": { "type": "number" }, "minutes": { "type": "number" } }, "required": ["intensity"] }""";
+
+    private const string Steps = """
+        {
+          "type": "array",
+          "description": "the session structure in order (warm-up, main set, cool-down); omit for a plain run at one effort",
+          "items": {
+            "type": "object",
+            "properties": { "repeat": { "type": "integer" }, "work": 
+        """ + Part + """
+        , "rest": 
+        """ + Part + """
+         },
+            "required": ["repeat", "work"]
+          }
+        }
+        """;
+
+    private const string Readiness = """
         {
           "type": "object",
           "properties": {
-            "rationale": { "type": "string", "description": "3-6 sentences explaining the plan structure for the athlete." },
-            "weekly_focus": {
-              "type": "array",
-              "items": {
-                "type": "object",
-                "properties": { "week": { "type": "integer" }, "focus": { "type": "string" } },
-                "required": ["week", "focus"]
-              }
-            }
+            "level": { "type": "string", "enum": ["green", "amber", "red"] },
+            "confidence": { "type": "string", "enum": ["low", "medium", "high"] },
+            "summary": { "type": "string", "description": "1-2 sentences: what the recovery data says about today" },
+            "concerns": { "type": "array", "items": { "type": "string" }, "description": "the signals that worry you, each with its value" }
           },
-          "required": ["rationale", "weekly_focus"]
+          "required": ["level", "confidence", "summary", "concerns"]
+        }
+        """;
+
+    private const string Changes = """
+        {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "workout_id": { "type": "string" },
+              "date": { "type": "string", "description": "yyyy-MM-dd: the session's date after the change" },
+              "type": { "type": "string", "enum": ["rest", "recovery", "easy", "long", "tempo", "interval", "race_pace"] },
+              "km": { "type": "number" },
+              "intensity": { "type": "string", "enum": 
+        """ + Intensities + """
+         },
+              "title": { "type": "string" },
+              "notes": { "type": "string" },
+              "steps": 
+        """ + Steps + """
+        ,
+              "reason": { "type": "string", "description": "one sentence for the athlete" },
+              "needs_approval": { "type": "boolean" }
+            },
+            "required": ["workout_id", "date", "type", "km", "reason", "needs_approval"]
+          }
         }
         """;
 
@@ -101,24 +144,33 @@ public static class LlmSchemas
           "type": "object",
           "properties": {
             "summary": { "type": "string", "description": "2-5 sentences for the athlete about this run and how to approach the next days." },
-            "suggestions": {
-              "type": "array",
-              "items": {
-                "type": "object",
-                "properties": {
-                  "workout_id": { "type": "string" },
-                  "action": { "type": "string", "enum": ["reduce_distance", "downgrade", "convert_to_rest", "swap_days", "increase_distance", "upgrade"] },
-                  "to_type": { "type": "string", "enum": ["rest", "recovery", "easy", "long", "tempo", "interval", "race_pace"] },
-                  "to_km": { "type": "number" },
-                  "new_date": { "type": "string", "description": "yyyy-MM-dd, only for swap_days" },
-                  "reason": { "type": "string" }
-                },
-                "required": ["workout_id", "action", "to_type", "to_km", "reason"]
-              }
-            },
+            "matched_workout_id": { "type": "string", "description": "workout_id of the planned session this run was, or an empty string" },
+            "pace_status": { "type": "string", "enum": ["faster", "on_target", "slower", "unknown"] },
+            "hr_status": { "type": "string", "enum": ["above", "in_zone", "below", "unknown"] },
+            "readiness": 
+        """ + Readiness + """
+        ,
+            "changes": 
+        """ + Changes + """
+        ,
             "symptom_concerns": { "type": "array", "items": { "type": "string" } }
           },
-          "required": ["summary", "suggestions", "symptom_concerns"]
+          "required": ["summary", "matched_workout_id", "pace_status", "hr_status", "readiness", "changes", "symptom_concerns"]
+        }
+        """;
+
+    public const string DailyCheck = """
+        {
+          "type": "object",
+          "properties": {
+            "readiness": 
+        """ + Readiness + """
+        ,
+            "advice": { "type": "string", "description": "1-3 sentences: how to approach today" },
+            "changes": 
+        """ + Changes + """
+          },
+          "required": ["readiness", "advice", "changes"]
         }
         """;
 
@@ -127,6 +179,23 @@ public static class LlmSchemas
           "type": "object",
           "properties": {
             "rationale": { "type": "string", "description": "3-6 sentences explaining the plan to the athlete." },
+            "paces": {
+              "type": "array",
+              "description": "your pace (and optional heart-rate) target for each intensity the plan uses",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "intensity": { "type": "string", "enum": 
+        """ + Intensities + """
+         },
+                  "pace_fast_sec_per_km": { "type": "integer" },
+                  "pace_slow_sec_per_km": { "type": "integer" },
+                  "hr_min": { "type": "integer" },
+                  "hr_max": { "type": "integer" }
+                },
+                "required": ["intensity", "pace_fast_sec_per_km", "pace_slow_sec_per_km"]
+              }
+            },
             "weeks": {
               "type": "array",
               "items": {
@@ -144,37 +213,13 @@ public static class LlmSchemas
                         "day": { "type": "string", "enum": ["mon", "tue", "wed", "thu", "fri", "sat", "sun"] },
                         "type": { "type": "string", "enum": ["recovery", "easy", "long", "tempo", "interval", "race_pace", "race"] },
                         "km": { "type": "number" },
-                        "title": { "type": "string", "description": "short workout name, e.g. '6 x 1 km at 5K pace' or 'Long run, last 5 km at half-marathon pace'" },
+                        "intensity": { "type": "string", "enum": 
+        """ + Intensities + """
+         },
+                        "title": { "type": "string" },
                         "notes": { "type": "string" },
-                        "steps": {
-                          "type": "array",
-                          "description": "the session structure in order (warm-up, main set, cool-down); omit for a plain run at one effort",
-                          "items": {
-                            "type": "object",
-                            "properties": {
-                              "repeat": { "type": "integer" },
-                              "work": {
-                              "type": "object",
-                              "properties": {
-                                "intensity": { "type": "string", "enum": ["recovery", "easy", "steady", "marathon", "half_marathon", "threshold", "ten_k", "five_k", "repetition", "hill", "strides", "race_pace"] },
-                                "km": { "type": "number" },
-                                "minutes": { "type": "number" }
-                              },
-                              "required": ["intensity"]
-                            },
-                              "rest": {
-                              "type": "object",
-                              "properties": {
-                                "intensity": { "type": "string", "enum": ["recovery", "easy", "steady", "marathon", "half_marathon", "threshold", "ten_k", "five_k", "repetition", "hill", "strides", "race_pace"] },
-                                "km": { "type": "number" },
-                                "minutes": { "type": "number" }
-                              },
-                              "required": ["intensity"]
-                            }
-                            },
-                            "required": ["repeat", "work"]
-                          }
-                        }
+                        "steps": 
+        """ + Steps + """
                       },
                       "required": ["day", "type", "km"]
                     }
@@ -184,7 +229,7 @@ public static class LlmSchemas
               }
             }
           },
-          "required": ["rationale", "weeks"]
+          "required": ["rationale", "paces", "weeks"]
         }
         """;
 
@@ -194,8 +239,9 @@ public static class LlmSchemas
           "properties": {
             "level": { "type": "string", "enum": ["beginner", "intermediate", "advanced"] },
             "summary": { "type": "string", "description": "2-4 sentences: where the athlete stands today relative to the goal race." },
+            "predicted_race_seconds": { "type": "integer", "description": "your prediction of the goal race time from current fitness, or 0 if the data is too thin" },
             "goal_verdict": { "type": "string", "enum": ["realistic", "ambitious", "unrealistic", "no_goal_time"] },
-            "goal_comment": { "type": "string", "description": "1-2 sentences on the goal time compared with the predicted time." },
+            "goal_comment": { "type": "string", "description": "1-2 sentences on the goal time compared with your prediction." },
             "strengths": { "type": "array", "items": { "type": "string" } },
             "limiters": {
               "type": "array",
@@ -222,7 +268,7 @@ public static class LlmSchemas
               }
             }
           },
-          "required": ["level", "summary", "goal_verdict", "goal_comment", "strengths", "limiters", "risks", "priorities"]
+          "required": ["level", "summary", "predicted_race_seconds", "goal_verdict", "goal_comment", "strengths", "limiters", "risks", "priorities"]
         }
         """;
 
@@ -250,17 +296,22 @@ public static class LlmSchemas
         """;
 }
 
-public sealed record PlanRationaleResponse(string Rationale, IReadOnlyList<WeeklyFocus>? WeeklyFocus);
+/// <summary>The LLM's readiness verdict as it answers it; checked by <see cref="LlmGates.Readiness"/>.</summary>
+public sealed record ReadinessDesign(string? Level, string? Confidence, string? Summary, IReadOnlyList<string>? Concerns);
 
-public sealed record RunAnalysisResponse(string Summary, IReadOnlyList<LlmSuggestion>? Suggestions, IReadOnlyList<string>? SymptomConcerns);
+/// <param name="MatchedWorkoutId">The planned session this run was, or empty.</param>
+public sealed record RunAnalysisResponse(
+    string? Summary, string? MatchedWorkoutId, string? PaceStatus, string? HrStatus, ReadinessDesign? Readiness,
+    IReadOnlyList<ChangeDesign>? Changes, IReadOnlyList<string>? SymptomConcerns);
 
-public sealed record LlmSuggestion(string WorkoutId, string Action, string? ToType, double ToKm, string? NewDate, string? Reason);
+public sealed record DailyCheckResponse(ReadinessDesign? Readiness, string? Advice, IReadOnlyList<ChangeDesign>? Changes);
 
 public sealed record WeeklyReportResponse(string Summary, string? FocusNextWeek);
 
 public sealed record SymptomTriageResponse(string Category, bool IsCurrent, string? Evidence);
 
 /// <summary>The LLM's diagnosis of the athlete against the goal race; stored with the plan and shared with later prompts.</summary>
+/// <param name="PredictedRaceSeconds">The coach's race-time prediction; 0 or null when the data was too thin.</param>
 public sealed record AthleteAssessment(
     string? Level,
     string? Summary,
@@ -269,8 +320,43 @@ public sealed record AthleteAssessment(
     IReadOnlyList<string>? Strengths,
     IReadOnlyList<Limiter>? Limiters,
     IReadOnlyList<string>? Risks,
-    IReadOnlyList<PhasePriority>? Priorities);
+    IReadOnlyList<PhasePriority>? Priorities,
+    int? PredictedRaceSeconds = null);
 
 public sealed record Limiter(string Area, string? Evidence);
 
 public sealed record PhasePriority(string Phase, string Focus);
+
+/// <summary>Integrity checks shared by the prompts that answer a readiness verdict.</summary>
+public static class LlmGates
+{
+    public static readonly string[] PaceStatuses = ["faster", "on_target", "slower", "unknown"];
+    public static readonly string[] HrStatuses = ["above", "in_zone", "below", "unknown"];
+
+    /// <summary>Reads the verdict; adds an error for anything that cannot be stored.</summary>
+    public static (ReadinessLevel Level, Confidence Confidence) Readiness(ReadinessDesign? r, List<string> errors)
+    {
+        if (r is null)
+        {
+            errors.Add("readiness_missing");
+            return default;
+        }
+
+        if (!Enum.TryParse<ReadinessLevel>(r.Level, ignoreCase: true, out var level) || !Enum.IsDefined(level))
+        {
+            errors.Add($"readiness_level_invalid: {r.Level ?? "null"}");
+        }
+
+        if (!Enum.TryParse<Confidence>(r.Confidence, ignoreCase: true, out var confidence) || !Enum.IsDefined(confidence))
+        {
+            errors.Add($"readiness_confidence_invalid: {r.Confidence ?? "null"}");
+        }
+
+        if (string.IsNullOrWhiteSpace(r.Summary))
+        {
+            errors.Add("readiness_summary_missing");
+        }
+
+        return (level, confidence);
+    }
+}

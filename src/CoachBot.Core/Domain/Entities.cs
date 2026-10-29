@@ -195,7 +195,7 @@ public class Recommendation
     public Guid? RunAnalysisId { get; set; }
     public string Trigger { get; set; } = "";
     public string Summary { get; set; } = "";
-    /// <summary>JSON array of <see cref="ProposedChange"/>.</summary>
+    /// <summary>JSON array of <see cref="WorkoutChange"/>.</summary>
     public string ChangesJson { get; set; } = "[]";
     public ChangeMagnitude Magnitude { get; set; }
     public RecommendationStatus Status { get; set; }
@@ -280,15 +280,13 @@ public class ReadinessCheck
     public DateTimeOffset CreatedAt { get; set; }
 }
 
-/// <summary>One concrete edit to one planned workout. Serialized into <see cref="Recommendation.ChangesJson"/>.</summary>
-public sealed record ProposedChange(
-    Guid WorkoutId,
-    DateOnly Date,
-    ChangeAction Action,
-    WorkoutType FromType,
-    WorkoutType ToType,
-    double FromKm,
-    double ToKm,
-    DateOnly? NewDate = null,
-    int? NewPaceMinSecPerKm = null,
-    int? NewPaceMaxSecPerKm = null);
+/// <summary>Everything a change can alter in a planned workout; the before/after of <see cref="PlanChange"/> and undo.</summary>
+public sealed record WorkoutState(
+    DateOnly Date, WorkoutType Type, double Km, int? DurationMinutes, int? PaceMin, int? PaceMax, int? HrMin, int? HrMax, string Title, string? Description,
+    string? Steps = null);
+
+/// <summary>
+/// One change to one planned workout, as shown to the athlete: the state before and the complete state after, texts
+/// included. Serialized into <see cref="Recommendation.ChangesJson"/>.
+/// </summary>
+public sealed record WorkoutChange(Guid WorkoutId, WorkoutState Before, WorkoutState After, string? Reason, bool NeedsApproval);
