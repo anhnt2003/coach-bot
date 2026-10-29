@@ -72,7 +72,7 @@ public sealed class FeedbackService(
     {
         var lang = athlete.Language;
         var keyword = SymptomDetector.Detect(text);
-        var triage = await llm.AskAsync<SymptomTriageResponse>("symptom_triage", new
+        var triage = await llm.AskOrNullAsync<SymptomTriageResponse>("symptom_triage", athlete.Id, new
         {
             message = text,
             keyword_matches = keyword.Matched,

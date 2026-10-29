@@ -69,12 +69,15 @@ public class LocalizationTests
         }
     }
 
+    /// <summary>Keys of the work the Telegram handler runs in the background.</summary>
+    private static readonly string[] BackgroundKeys = ["plan", "report", "daily", "sync", "note", "symptom"];
+
     [Fact]
     public void Every_key_referenced_in_source_exists()
     {
         var root = RepoRoot();
         var source = string.Join("\n", Directory.EnumerateFiles(Path.Combine(root, "src"), "*.cs", SearchOption.AllDirectories).Select(File.ReadAllText));
-        var prefixes = new[] { "adapt.", "alert.", "analysis.", "assess.", "button.", "change.", "common.", "connect.", "daily.", "feedback.", "goal.", "pause.", "plan.", "profile.", "push.", "readiness.", "rec.", "report.", "resume.", "safety.", "start.", "status.", "symptom.", "sync.", "weekly.", "workout.", "zones." };
+        var prefixes = new[] { "adapt.", "alert.", "analysis.", "assess.", "busy.", "button.", "change.", "common.", "connect.", "daily.", "error.", "feedback.", "goal.", "job.", "llm.", "pause.", "plan.", "profile.", "push.", "queued.", "readiness.", "rec.", "report.", "resume.", "safety.", "start.", "status.", "symptom.", "sync.", "weekly.", "work.", "workout.", "zones." };
         var literal = Regex.Matches(source, "\"([a-z_]+\\.[a-z_.]+)\"").Select(m => m.Groups[1].Value)
             .Where(k => prefixes.Any(k.StartsWith) && !k.EndsWith('.') && k != "plan.infeasible")
             .Distinct();
@@ -97,6 +100,9 @@ public class LocalizationTests
             .. new[] { "beginner", "intermediate", "advanced" }.Select(l => $"assess.level.{l}"),
             .. new[] { "realistic", "ambitious", "unrealistic" }.Select(v => $"assess.verdict.{v}"),
             .. new[] { "aerobic_base", "long_run_endurance", "threshold", "vo2max", "speed", "race_specific", "consistency", "recovery" }.Select(a => $"assess.limiter.{a}"),
+            .. BackgroundKeys.SelectMany(k => new[] { $"llm.failed.{k}", $"work.{k}" }),
+            .. Enum.GetNames<LlmFailure>().Select(r => $"llm.reason.{r.ToLowerInvariant()}"),
+            .. new[] { "sync", "daily_check", "weekly_report", "coros_push", "expire_recommendations" }.Select(j => $"job.name.{j}"),
             "help", "disclaimer",
         ];
 
@@ -239,7 +245,7 @@ public class OpenAiCompatibleClientTests
 {
     private const string Schema = """{"type":"object","properties":{"summary":{"type":"string"}},"required":["summary"]}""";
 
-    private static OpenAiCompatibleLlmClient Client(StubHandler handler, string? baseUrl = "https://llm.example/v1/", string model = "m-1", string? apiKey = "k-123") =>
+    private static OpenAiCompatibleLlmClient Client(StubHandler handler, string baseUrl = "https://llm.example/v1/", string model = "m-1", string? apiKey = "k-123") =>
         new(new HttpClient(handler), Options.Create(new LlmOptions { Provider = "openai_compatible", BaseUrl = baseUrl, Model = model, ApiKey = apiKey }),
             NullLogger<OpenAiCompatibleLlmClient>.Instance);
 
@@ -273,17 +279,34 @@ public class OpenAiCompatibleClientTests
     }
 
     [Fact]
-    public async Task Errors_return_null()
+    public async Task Http_errors_throw_a_typed_exception()
     {
         var handler = new StubHandler(_ => StubHandler.Json(HttpStatusCode.TooManyRequests, """{"error":{"message":"quota"}}"""));
-        Assert.Null(await Client(handler).GenerateJsonAsync(new LlmRequest("t", "s", "u", Schema), CancellationToken.None));
+
+        var ex = await Assert.ThrowsAsync<LlmException>(() => Client(handler).GenerateJsonAsync(new LlmRequest("t", "s", "u", Schema), CancellationToken.None));
+
+        Assert.Equal(LlmFailure.Http, ex.Reason);
+        Assert.Equal("t", ex.Purpose);
+        Assert.Contains("429", ex.Detail, StringComparison.Ordinal);
     }
 
     [Theory]
-    [InlineData(null, "m-1")]
-    [InlineData("https://llm.example/v1", "")]
-    public void Disabled_without_base_url_or_model(string? baseUrl, string model) =>
-        Assert.False(Client(new StubHandler(), baseUrl, model).IsEnabled);
+    [InlineData("openai_compatible", null, "m-1")]
+    [InlineData("openai_compatible", "https://llm.example/v1", null)]
+    [InlineData("none", "https://llm.example/v1", "m-1")]
+    public void The_llm_is_required(string provider, string? baseUrl, string? model)
+    {
+        var config = new ConfigurationBuilder().AddInMemoryCollection(new Dictionary<string, string?>
+        {
+            ["ConnectionStrings:Postgres"] = "Host=localhost;Database=x",
+            ["Llm:Provider"] = provider,
+            ["Llm:BaseUrl"] = baseUrl,
+            ["Llm:Model"] = model,
+        }).Build();
+        using var sp = new ServiceCollection().AddLogging().AddCoachBotCore(config).BuildServiceProvider();
+
+        Assert.Throws<OptionsValidationException>(() => sp.GetRequiredService<IOptions<LlmOptions>>().Value);
+    }
 
     private static HttpResponseMessage Stream(string events) =>
         new(HttpStatusCode.OK) { Content = new StringContent(events, Encoding.UTF8, "text/event-stream") };
@@ -324,14 +347,44 @@ public class OpenAiCompatibleClientTests
         Assert.Equal("""{"summary":"ok"}""", await Client(handler).GenerateJsonAsync(new LlmRequest("t", "s", "u", Schema), CancellationToken.None));
     }
 
-    [Fact]
-    public async Task Errors_return_null_or_throw_for_the_caller_to_fall_back()
-    {
-        var gatewayTimeout = new StubHandler(_ => new HttpResponseMessage((HttpStatusCode)524) { Content = new StringContent("timeout") });
-        Assert.Null(await Client(gatewayTimeout).GenerateJsonAsync(new LlmRequest("t", "s", "u", Schema), CancellationToken.None));
+    private static async Task<LlmException> FailureAsync(StubHandler handler, CancellationToken ct = default) =>
+        await Assert.ThrowsAsync<LlmException>(() => Client(handler).GenerateJsonAsync(new LlmRequest("t", "s", "u", Schema), ct));
 
-        var streamError = new StubHandler(_ => Stream("data: {\"error\":{\"message\":\"upstream overloaded\"}}\n\n"));
-        await Assert.ThrowsAsync<HttpRequestException>(() => Client(streamError).GenerateJsonAsync(new LlmRequest("t", "s", "u", Schema), CancellationToken.None));
+    [Fact]
+    public async Task Gateway_timeouts_stream_errors_and_empty_answers_are_failures()
+    {
+        var gatewayTimeout = await FailureAsync(new StubHandler(_ => new HttpResponseMessage((HttpStatusCode)524) { Content = new StringContent("timeout") }));
+        Assert.Equal(LlmFailure.Http, gatewayTimeout.Reason);
+        Assert.Contains("524", gatewayTimeout.Detail, StringComparison.Ordinal);
+
+        var streamError = await FailureAsync(new StubHandler(_ => Stream("data: {\"error\":{\"message\":\"upstream overloaded\"}}\n\n")));
+        Assert.Equal(LlmFailure.Http, streamError.Reason);
+        Assert.Contains("upstream overloaded", streamError.Detail, StringComparison.Ordinal);
+
+        var empty = await FailureAsync(new StubHandler(_ => StubHandler.Json(HttpStatusCode.OK, """{"choices":[{"message":{"content":""},"finish_reason":"length"}]}""")));
+        Assert.Equal(LlmFailure.Empty, empty.Reason);
+        Assert.Contains("length", empty.Detail, StringComparison.Ordinal);
+
+        var unexpected = await FailureAsync(new StubHandler(_ => StubHandler.Json(HttpStatusCode.OK, """{"object":"error"}""")));
+        Assert.Equal(LlmFailure.Http, unexpected.Reason);
+    }
+
+    [Fact]
+    public async Task Timeouts_are_failures_but_a_cancelled_caller_is_not()
+    {
+        var polly = await FailureAsync(new StubHandler(_ => throw new Polly.Timeout.TimeoutRejectedException()));
+        Assert.Equal(LlmFailure.Timeout, polly.Reason);
+
+        var deadline = await FailureAsync(new StubHandler(_ => throw new TaskCanceledException()));
+        Assert.Equal(LlmFailure.Timeout, deadline.Reason);
+
+        var connection = await FailureAsync(new StubHandler(_ => throw new HttpRequestException("connection refused")));
+        Assert.Equal(LlmFailure.Http, connection.Reason);
+
+        using var cancelled = new CancellationTokenSource();
+        await cancelled.CancelAsync();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            Client(new StubHandler(_ => throw new TaskCanceledException())).GenerateJsonAsync(new LlmRequest("t", "s", "u", Schema), cancelled.Token));
     }
 
     [Fact]
@@ -343,13 +396,16 @@ public class OpenAiCompatibleClientTests
             ["ConnectionStrings:Postgres"] = "Host=localhost;Database=x",
             ["Llm:Provider"] = "openai_compatible",
             ["Llm:BaseUrl"] = "https://llm.example/v1",
+            ["Llm:Model"] = "m-1",
         }).Build();
         var services = new ServiceCollection().AddLogging();
         services.AddCoachBotCore(config);
         services.AddHttpClient<OpenAiCompatibleLlmClient>().ConfigurePrimaryHttpMessageHandler(() => handler);
         await using var sp = services.BuildServiceProvider();
 
-        Assert.Null(await sp.GetRequiredService<OpenAiCompatibleLlmClient>().GenerateJsonAsync(new LlmRequest("t", "s", "u", Schema), CancellationToken.None));
+        var ex = await Assert.ThrowsAsync<LlmException>(() =>
+            sp.GetRequiredService<OpenAiCompatibleLlmClient>().GenerateJsonAsync(new LlmRequest("t", "s", "u", Schema), CancellationToken.None));
+        Assert.Equal(LlmFailure.Http, ex.Reason);
         Assert.Single(handler.Requests);
     }
 }

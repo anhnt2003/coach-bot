@@ -73,6 +73,10 @@ public static class DependencyInjection
     {
         services.AddOptions<JobsOptions>().Bind(config.GetSection(JobsOptions.Section));
         services.AddScoped<TelegramUpdateHandler>();
+        services.AddSingleton<IChatSender, TelegramChatSender>();
+        services.AddSingleton<BackgroundWork>();
+        // Registered before the bot so it stops after it: running jobs are waited for on shutdown.
+        services.AddHostedService(sp => sp.GetRequiredService<BackgroundWork>());
         services.AddHostedService<StartupChecks>();
         services.AddHostedService<TelegramBotService>();
         services.AddSingleton<CronJobService>();
@@ -84,6 +88,7 @@ public static class DependencyInjection
     {
         services.AddOptions<LlmOptions>().Bind(config.GetSection(LlmOptions.Section)).ValidateDataAnnotations().ValidateOnStart();
         services.AddSingleton<IPromptLibrary, EmbeddedPromptLibrary>();
+        services.AddSingleton<ILlmCallLog, DbLlmCallLog>();
 
         var limits = config.GetSection(LlmOptions.Section).Get<LlmOptions>() ?? new LlmOptions();
         void Resilience(IHttpClientBuilder b) => b.AddStandardResilienceHandler(o =>
@@ -98,13 +103,7 @@ public static class DependencyInjection
         });
 
         Resilience(services.AddHttpClient<OpenAiCompatibleLlmClient>(c => c.Timeout = Timeout.InfiniteTimeSpan));
-
-        var provider = config.GetSection(LlmOptions.Section)["Provider"] ?? "none";
-        services.AddTransient<ILlmClient>(sp => provider switch
-        {
-            "openai_compatible" => sp.GetRequiredService<OpenAiCompatibleLlmClient>(),
-            _ => new NullLlmClient(),
-        });
+        services.AddTransient<ILlmClient>(sp => sp.GetRequiredService<OpenAiCompatibleLlmClient>());
     }
 
     private static void AddCoros(IServiceCollection services)

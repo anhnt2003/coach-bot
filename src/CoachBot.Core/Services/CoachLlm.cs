@@ -5,51 +5,75 @@ using Microsoft.Extensions.Logging;
 namespace CoachBot.Core.Services;
 
 /// <summary>
-/// Thin structured-output wrapper over <see cref="ILlmClient"/>. Never throws: any provider error, timeout or
-/// malformed output yields null, and callers fall back to deterministic templates.
+/// Structured-output wrapper over <see cref="ILlmClient"/>. Returns the parsed answer once it passed the optional
+/// integrity gate, or throws <see cref="LlmException"/>. Every call is recorded in llm_calls.
 /// </summary>
-public sealed class CoachLlm(ILlmClient client, IPromptLibrary prompts, ILogger<CoachLlm> logger)
+public sealed class CoachLlm(ILlmClient client, IPromptLibrary prompts, ILlmCallLog log, TimeProvider time, ILogger<CoachLlm> logger)
 {
-    public bool IsEnabled => client.IsEnabled;
-
     public string ProviderName => client.ProviderName;
 
-    public async Task<T?> AskAsync<T>(string promptName, object context, string language, string jsonSchema, CancellationToken ct)
+    /// <param name="gate">Integrity checks on the parsed answer: any message fails the call with <see cref="LlmFailure.Integrity"/>,
+    /// so nothing the caller would write from a malformed answer reaches the database.</param>
+    public async Task<T> AskAsync<T>(string promptName, Guid? athleteId, object context, string language, string jsonSchema,
+        CancellationToken ct, Func<T, IReadOnlyList<string>>? gate = null)
         where T : class
     {
-        if (!client.IsEnabled)
-        {
-            return null;
-        }
-
+        var contextJson = CoachJson.Serialize(context);
+        var system = prompts.Get("system").Replace("{{language}}", language == "vi" ? "Vietnamese" : "English", StringComparison.Ordinal);
+        var user = prompts.Get(promptName).Replace("{{context}}", contextJson, StringComparison.Ordinal);
+        var started = time.GetTimestamp();
+        string? json = null;
         try
         {
-            var system = prompts.Get("system").Replace("{{language}}", language == "vi" ? "Vietnamese" : "English", StringComparison.Ordinal);
-            var user = prompts.Get(promptName).Replace("{{context}}", CoachJson.Serialize(context), StringComparison.Ordinal);
-            var json = await client.GenerateJsonAsync(new LlmRequest(promptName, system, user, jsonSchema), ct);
-            if (json is null)
+            json = await client.GenerateJsonAsync(new LlmRequest(promptName, system, user, jsonSchema), ct);
+            T? result;
+            try
             {
-                return null;
+                result = JsonSerializer.Deserialize<T>(json, CoachJson.Options);
+            }
+            catch (JsonException ex)
+            {
+                throw new LlmException(promptName, LlmFailure.Schema, ex.Message, ex);
             }
 
-            var result = JsonSerializer.Deserialize<T>(json, CoachJson.Options);
             if (result is null)
             {
-                logger.LogWarning("LLM returned empty output for {Prompt}", promptName);
+                throw new LlmException(promptName, LlmFailure.Schema, "the answer is the JSON literal null");
             }
 
+            var errors = gate?.Invoke(result) ?? [];
+            if (errors.Count > 0)
+            {
+                throw new LlmException(promptName, LlmFailure.Integrity, string.Join("; ", errors.Take(20)));
+            }
+
+            await log.RecordAsync(new LlmCallRecord(athleteId, promptName, client.ProviderName, contextJson, json, null, null, Elapsed(started)), ct);
             return result;
         }
-        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        catch (LlmException ex)
         {
+            logger.LogWarning("LLM {Prompt} failed ({Reason}): {Detail}", promptName, ex.Reason, ex.Detail);
+            var detail = ex.Detail.Length > 2000 ? ex.Detail[..2000] : ex.Detail;
+            await log.RecordAsync(new LlmCallRecord(athleteId, promptName, client.ProviderName, contextJson, json, ex.Reason, detail, Elapsed(started)), ct);
             throw;
         }
-        catch (Exception ex)
+    }
+
+    /// <summary>Temporary bridge for services that still fall back to rules; removed once every caller handles failures.</summary>
+    public async Task<T?> AskOrNullAsync<T>(string promptName, Guid? athleteId, object context, string language, string jsonSchema, CancellationToken ct)
+        where T : class
+    {
+        try
         {
-            logger.LogWarning(ex, "LLM call for {Prompt} failed; using rule-based fallback", promptName);
+            return await AskAsync<T>(promptName, athleteId, context, language, jsonSchema, ct);
+        }
+        catch (LlmException)
+        {
             return null;
         }
     }
+
+    private int Elapsed(long started) => (int)time.GetElapsedTime(started).TotalMilliseconds;
 }
 
 public static class LlmSchemas

@@ -117,6 +117,7 @@ public enum AlertType
     SyncFailure,
     CorosAuth,
     PushFailure,
+    AnalysisFailure,
 }
 
 public enum AlertSeverity

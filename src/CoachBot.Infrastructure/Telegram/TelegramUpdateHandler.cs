@@ -4,6 +4,7 @@ using CoachBot.Core.Abstractions;
 using CoachBot.Core.Domain;
 using CoachBot.Core.Services;
 using CoachBot.Infrastructure.Coros;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -22,17 +23,22 @@ public sealed partial class TelegramUpdateHandler(
     ReportService reports,
     FeedbackService feedback,
     RecommendationService recommendations,
-    SyncService sync,
-    AnalysisService analysis,
     CorosPushService push,
     CorosConnectService connect,
     ICorosGateway gateway,
+    BackgroundWork background,
     MessageFormatter fmt,
     TimeProvider time,
     ILogger<TelegramUpdateHandler> logger)
 {
     private ITelegramBotClient _bot = null!;
     private long _chatId;
+
+    /// <summary>Work that runs after the update has been answered, in its own scope with a freshly loaded athlete.</summary>
+    private delegate Task<OutboundMessage?> AthleteJob(IServiceProvider services, Athlete athlete, CancellationToken ct);
+
+    /// <summary>The athlete's language once known; used for the error message when handling fails.</summary>
+    public string Language { get; private set; } = coach.Value.Language;
 
     public bool IsAllowed(long chatId) => telegram.Value.AllowedChatId == chatId;
 
@@ -101,7 +107,7 @@ public sealed partial class TelegramUpdateHandler(
             athlete = await athletes.LinkTelegramAsync(_chatId, firstName, ct);
         }
 
-        var lang = athlete.Language;
+        var lang = Language = athlete.Language;
         // The coach works from COROS data only: until COROS is connected, every other command asks for /connect.
         var connected = await connect.IsConnectedAsync(athlete.Id, ct);
         var isRedirect = command is null && text.Contains("/oauth/coros/callback?", StringComparison.Ordinal);
@@ -134,7 +140,7 @@ public sealed partial class TelegramUpdateHandler(
                 await ReplyAsync(fmt.T(athlete.Language, "profile.language_set"), ct);
                 break;
             case "/plan":
-                await PlanAsync(athlete, ct);
+                await StartAsync(athlete, "plan", new OutboundMessage(fmt.T(lang, "queued.plan")), PlanJobAsync, ct);
                 break;
             case "/today":
                 await ReplyAsync(await reports.TodayAsync(athlete, ct), ct);
@@ -144,16 +150,20 @@ public sealed partial class TelegramUpdateHandler(
                 break;
             case "/daily":
                 // Same message the 06:30 job sends; handy for testing.
-                await ReplyAsync(await reports.DailyCheckAsync(athlete, ct) ?? new OutboundMessage(fmt.T(lang, "report.nothing")), ct);
+                await StartAsync(athlete, "daily", new OutboundMessage(fmt.T(lang, "queued.daily")), static async (sp, a, token) =>
+                    await sp.GetRequiredService<ReportService>().DailyCheckAsync(a, token)
+                    ?? new OutboundMessage(sp.GetRequiredService<MessageFormatter>().T(a.Language, "report.nothing")), ct);
                 break;
             case "/status":
                 await ReplyAsync(await reports.StatusAsync(athlete, ct), ct);
                 break;
             case "/report":
-                await ReplyAsync(await reports.WeeklyReportAsync(athlete, ct) ?? new OutboundMessage(fmt.T(lang, "report.nothing")), ct);
+                await StartAsync(athlete, "report", new OutboundMessage(fmt.T(lang, "queued.report")), static async (sp, a, token) =>
+                    await sp.GetRequiredService<ReportService>().WeeklyReportAsync(a, token)
+                    ?? new OutboundMessage(sp.GetRequiredService<MessageFormatter>().T(a.Language, "report.nothing")), ct);
                 break;
             case "/sync":
-                await SyncAsync(athlete, rest == "full", ct);
+                await StartSyncAsync(athlete, rest == "full", ct);
                 break;
             case "/push":
                 await PushAsync(athlete, ct);
@@ -165,8 +175,11 @@ public sealed partial class TelegramUpdateHandler(
                 await connect.DisconnectAsync(athlete.Id, ct);
                 await ReplyAsync(fmt.T(lang, "connect.disconnected"), ct);
                 break;
+            case "/feedback" when rest.Length == 0:
+                await ReplyAsync(fmt.T(lang, "feedback.usage"), ct);
+                break;
             case "/feedback":
-                await ReplyAsync(rest.Length == 0 ? new OutboundMessage(fmt.T(lang, "feedback.usage")) : await feedback.RecordNoteAsync(athlete, rest, false, ct), ct);
+                await StartNoteAsync(athlete, rest, ct);
                 break;
             case "/soreness" when int.TryParse(rest, out var soreness):
                 await ReplyAsync(await feedback.RecordSorenessAsync(athlete, soreness, ct), ct);
@@ -185,7 +198,7 @@ public sealed partial class TelegramUpdateHandler(
                 break;
             case null:
                 // Any free text is feedback, and is always screened for red-flag symptoms.
-                await ReplyAsync(await feedback.RecordNoteAsync(athlete, text, false, ct), ct);
+                await StartNoteAsync(athlete, text, ct);
                 break;
             default:
                 await ReplyAsync(fmt.T(lang, "help"), ct);
@@ -196,7 +209,7 @@ public sealed partial class TelegramUpdateHandler(
     private async Task OnCallbackAsync(string data, int messageId, CancellationToken ct)
     {
         var athlete = await athletes.GetOrCreatePrimaryAsync(ct);
-        var lang = athlete.Language;
+        var lang = Language = athlete.Language;
         if (!await connect.IsConnectedAsync(athlete.Id, ct))
         {
             // Buttons stay, so they can be tapped again once COROS is connected.
@@ -323,21 +336,45 @@ public sealed partial class TelegramUpdateHandler(
         _ => null,
     };
 
-    private async Task PlanAsync(Athlete athlete, CancellationToken ct)
+    /// <summary>
+    /// Queues work that waits for the LLM, so the update loop stays free. The job never touches this handler: it runs in
+    /// its own scope with the athlete reloaded there.
+    /// </summary>
+    private async Task StartAsync(Athlete athlete, string key, OutboundMessage? started, AthleteJob job, CancellationToken ct)
     {
+        var athleteId = athlete.Id;
+        var accepted = background.TryStart(_chatId, key, athlete.Language, started, async (sp, token) =>
+        {
+            var reloaded = await sp.GetRequiredService<ICoachDb>().Athletes.SingleAsync(a => a.Id == athleteId, token);
+            return await job(sp, reloaded, token);
+        });
+        if (!accepted)
+        {
+            await ReplyAsync(fmt.T(athlete.Language, "busy.running", fmt.T(athlete.Language, $"work.{key}")), ct);
+        }
+    }
+
+    private static async Task<OutboundMessage?> PlanJobAsync(IServiceProvider sp, Athlete athlete, CancellationToken ct)
+    {
+        var plans = sp.GetRequiredService<PlanService>();
+        var fmt = sp.GetRequiredService<MessageFormatter>();
         var lang = athlete.Language;
-        await ReplyAsync(fmt.T(lang, "plan.generating"), ct);
         var result = await plans.GenerateAsync(athlete, ct);
         if (result.Plan is null)
         {
             var lines = result.Warnings.Where(w => w != result.FailureKey).Select(w => "⚠️ " + fmt.T(lang, w));
-            await ReplyAsync(string.Join("\n", [fmt.T(lang, result.FailureKey ?? "plan.failed"), .. lines]), ct);
-            return;
+            return new OutboundMessage(string.Join("\n", [fmt.T(lang, result.FailureKey ?? "plan.failed"), .. lines]));
         }
 
-        var goal = (await athletes.GetActiveGoalAsync(athlete.Id, ct))!;
-        await ReplyAsync(plans.RenderProposal(athlete, result.Plan, goal, result.Warnings), ct);
+        var goal = (await sp.GetRequiredService<AthleteService>().GetActiveGoalAsync(athlete.Id, ct))!;
+        return plans.RenderProposal(athlete, result.Plan, goal, result.Warnings);
     }
+
+    private Task StartNoteAsync(Athlete athlete, string text, CancellationToken ct) =>
+        StartAsync(athlete, "note", null, (sp, a, token) => RecordNoteAsync(sp, a, text, false, token), ct);
+
+    private static async Task<OutboundMessage?> RecordNoteAsync(IServiceProvider sp, Athlete athlete, string text, bool explicitSymptomReport, CancellationToken ct) =>
+        await sp.GetRequiredService<FeedbackService>().RecordNoteAsync(athlete, text, explicitSymptomReport, ct);
 
     private async Task ApprovePlanAsync(Athlete athlete, Guid planId, CancellationToken ct)
     {
@@ -358,24 +395,24 @@ public sealed partial class TelegramUpdateHandler(
         await PushAsync(athlete, ct);
     }
 
-    private async Task SyncAsync(Athlete athlete, bool full, CancellationToken ct)
-    {
-        var lang = athlete.Language;
-        var result = full
-            ? await sync.SyncAsync(athlete, SyncService.FullActivityDays, SyncService.FullMetricDays, ct)
-            : await sync.SyncAsync(athlete, SyncService.ActivityDays, SyncService.MetricDays, ct);
-        if (!result.Success)
+    /// <summary>Pulls COROS data, then analyzes recent runs; each analysis sends its own message.</summary>
+    private Task StartSyncAsync(Athlete athlete, bool full, CancellationToken ct) =>
+        StartAsync(athlete, "sync", null, async (sp, a, token) =>
         {
-            await ReplyAsync(fmt.T(lang, "sync.failed", result.Error), ct);
-            return;
-        }
+            var sync = sp.GetRequiredService<SyncService>();
+            var f = sp.GetRequiredService<MessageFormatter>();
+            var result = full
+                ? await sync.SyncAsync(a, SyncService.FullActivityDays, SyncService.FullMetricDays, token)
+                : await sync.SyncAsync(a, SyncService.ActivityDays, SyncService.MetricDays, token);
+            if (!result.Success)
+            {
+                return new OutboundMessage(f.T(a.Language, "sync.failed", result.Error));
+            }
 
-        await ReplyAsync(fmt.T(lang, "sync.done", result.NewActivities, result.MetricDays), ct);
-        if (result.NewRunIds.Count > 0)
-        {
-            await analysis.AnalyzeRunsAsync(athlete, result.NewRunIds, ct);
-        }
-    }
+            await sp.GetRequiredService<INotifier>().SendAsync(a.Id, new OutboundMessage(f.T(a.Language, "sync.done", result.NewActivities, result.MetricDays)), token);
+            await sp.GetRequiredService<AnalysisService>().AnalyzePendingAsync(a, token);
+            return null;
+        }, ct);
 
     private async Task PushAsync(Athlete athlete, CancellationToken ct)
     {
@@ -406,13 +443,13 @@ public sealed partial class TelegramUpdateHandler(
         await AfterConnectAsync(athlete, ct);
     }
 
-    /// <summary>Verifies the tools and backfills history so a plan can be generated from real data.</summary>
-    public async Task AfterConnectAsync(Athlete athlete, CancellationToken ct)
+    /// <summary>Verifies the tools, then backfills history in the background so a plan can be generated from real data.</summary>
+    private async Task AfterConnectAsync(Athlete athlete, CancellationToken ct)
     {
         var lang = athlete.Language;
         var caps = await gateway.GetCapabilitiesAsync(athlete.Id, ct);
         await ReplyAsync(fmt.T(lang, "connect.done", caps.Tools.Count, fmt.T(lang, caps.CanPushWorkouts ? "common.yes" : "common.no")), ct);
-        await SyncAsync(athlete, full: true, ct);
+        await StartSyncAsync(athlete, full: true, ct);
     }
 
     private async Task SymptomAsync(Athlete athlete, string text, CancellationToken ct)
@@ -420,7 +457,8 @@ public sealed partial class TelegramUpdateHandler(
         var lang = athlete.Language;
         if (text.Length > 0)
         {
-            await ReplyAsync(await feedback.RecordNoteAsync(athlete, text, true, ct), ct);
+            await StartAsync(athlete, "symptom", new OutboundMessage(fmt.T(lang, "queued.symptom")),
+                (sp, a, token) => RecordNoteAsync(sp, a, text, true, token), ct);
             return;
         }
 

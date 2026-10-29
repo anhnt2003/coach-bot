@@ -70,25 +70,22 @@ public sealed class PlanService(
         AthleteAssessment? assessment = null;
         var generatedBy = "rules";
 
-        if (llm.IsEnabled)
+        var notesSince = time.GetUtcNow().AddDays(-30);
+        var notes = await db.Feedback.Where(f => f.AthleteId == athlete.Id && f.Notes != null && f.CreatedAt >= notesSince)
+            .OrderByDescending(f => f.CreatedAt).Select(f => f.Notes!).Take(10).ToListAsync(ct);
+        assessment = await AssessAsync(athlete, goal, history, zones.Zones, draft, notes, warnings, ct);
+        var (designed, fallbackReason) = await DesignWithLlmAsync(athlete, goal, history, zones.Zones, draft, constraints, validator, options, assessment, notes, warnings, ct);
+        if (designed is not null)
         {
-            var notesSince = time.GetUtcNow().AddDays(-30);
-            var notes = await db.Feedback.Where(f => f.AthleteId == athlete.Id && f.Notes != null && f.CreatedAt >= notesSince)
-                .OrderByDescending(f => f.CreatedAt).Select(f => f.Notes!).Take(10).ToListAsync(ct);
-            assessment = await AssessAsync(athlete, goal, history, zones.Zones, draft, notes, warnings, ct);
-            var (designed, fallbackReason) = await DesignWithLlmAsync(athlete, goal, history, zones.Zones, draft, constraints, validator, options, assessment, notes, warnings, ct);
-            if (designed is not null)
-            {
-                (workouts, rationale, focus) = (designed.Workouts, designed.Rationale, designed.Focus);
-                warnings.AddRange(designed.Warnings.Except(warnings));
-                generatedBy = $"llm:{llm.ProviderName}";
-            }
-            else
-            {
-                warnings.Add(fallbackReason!);
-                var explained = await ExplainRulePlanAsync(goal, history, zones.Zones, draft, warnings, lang, ct);
-                (rationale, focus) = (explained?.Rationale, explained?.WeeklyFocus);
-            }
+            (workouts, rationale, focus) = (designed.Workouts, designed.Rationale, designed.Focus);
+            warnings.AddRange(designed.Warnings.Except(warnings));
+            generatedBy = $"llm:{llm.ProviderName}";
+        }
+        else
+        {
+            warnings.Add(fallbackReason!);
+            var explained = await ExplainRulePlanAsync(goal, history, zones.Zones, draft, warnings, lang, ct);
+            (rationale, focus) = (explained?.Rationale, explained?.WeeklyFocus);
         }
 
         foreach (var w in workouts)
@@ -234,7 +231,7 @@ public sealed class PlanService(
             baseline_plan = PlanDesignMapper.ToDesign(draft.Workouts),
         };
 
-        var design = await llm.AskAsync<PlanDesign>("plan_design", context, athlete.Language, LlmSchemas.PlanDesign, ct);
+        var design = await llm.AskOrNullAsync<PlanDesign>("plan_design", athlete.Id, context, athlete.Language, LlmSchemas.PlanDesign, ct);
         if (design is null)
         {
             return (null, "plan.llm_unavailable");
@@ -253,7 +250,7 @@ public sealed class PlanService(
         if (violations.Any(v => !v.IsGuideline))
         {
             logger.LogWarning("LLM plan design broke enforced limits: {Violations}", Describe(violations.Where(v => !v.IsGuideline)));
-            var repaired = await llm.AskAsync<PlanDesign>("plan_design_repair", new
+            var repaired = await llm.AskOrNullAsync<PlanDesign>("plan_design_repair", athlete.Id, new
             {
                 previous_design = design,
                 violations = violations.Where(v => !v.IsGuideline).Select(v => new { v.Code, week = v.WeekIndex + 1, v.Date, v.Detail }),
@@ -315,7 +312,7 @@ public sealed class PlanService(
     private Task<AthleteAssessment?> AssessAsync(
         Athlete athlete, RaceGoal goal, History history, TrainingZones zones, PlanDraft draft, IReadOnlyList<string> notes,
         IReadOnlyList<string> warnings, CancellationToken ct) =>
-        llm.AskAsync<AthleteAssessment>("athlete_assessment", new
+        llm.AskOrNullAsync<AthleteAssessment>("athlete_assessment", athlete.Id, new
         {
             race = new
             {
@@ -350,7 +347,7 @@ public sealed class PlanService(
 
     private Task<PlanRationaleResponse?> ExplainRulePlanAsync(
         RaceGoal goal, History history, TrainingZones zones, PlanDraft draft, IReadOnlyList<string> warnings, string lang, CancellationToken ct) =>
-        llm.AskAsync<PlanRationaleResponse>("plan_rationale", new
+        llm.AskOrNullAsync<PlanRationaleResponse>("plan_rationale", goal.AthleteId, new
         {
             race = new { goal.Name, goal.RaceDate, goal.DistanceKm, goal_time = goal.GoalTimeSeconds },
             current_fitness = new { weekly_km = history.WeeklyKmAvg, longest_run_km = history.LongestRunKm, weeks_of_history = history.WeeksOfHistory, history.Vo2Max, zones },

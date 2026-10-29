@@ -41,6 +41,8 @@ public class SchemaMappingTests(PostgresFixture pg)
             db.Add(new PlanChange { PlanId = plan.Id, PlannedWorkoutId = workout.Id, RecommendationId = rec.Id, BeforeJson = "{}", AfterJson = "{}", Reason = "r", AppliedBy = "auto", AppliedAt = now });
             db.Add(new Alert { AthleteId = athlete.Id, Type = AlertType.Fatigue, Severity = AlertSeverity.Warning, Message = "m", DedupKey = "k", CreatedAt = now });
             db.Add(new JobRun { JobName = "sync", RunKey = "k", StartedAt = now, Status = "succeeded" });
+            db.Add(new LlmCall { AthleteId = athlete.Id, Purpose = "plan_design", Model = "scripted", ContextJson = """{"k":1}""", Response = "{", Status = "schema", Error = "e", DurationMs = 12, CreatedAt = now });
+            db.Add(new ReadinessCheck { AthleteId = athlete.Id, Date = new DateOnly(2026, 10, 21), Level = ReadinessLevel.Amber, Confidence = Confidence.High, Summary = "s", ConcernsJson = """["hrv"]""", Source = "daily_check", CreatedAt = now });
             await db.SaveChangesAsync();
         }
 
@@ -55,12 +57,18 @@ public class SchemaMappingTests(PostgresFixture pg)
             Assert.Equal(1, await db.PlanChanges.CountAsync());
             Assert.Equal(1, await db.JobRuns.CountAsync());
             Assert.Equal("""["a"]""", (await db.CorosConnections.SingleAsync()).CapabilitiesJson);
+            var call = await db.LlmCalls.SingleAsync();
+            Assert.Equal(("schema", "{", """{"k": 1}"""), (call.Status, call.Response, call.ContextJson));
+            var check = await db.ReadinessChecks.SingleAsync();
+            Assert.Equal((ReadinessLevel.Amber, Confidence.High, """["hrv"]"""), (check.Level, check.Confidence, check.ConcernsJson));
 
             // Deleting the athlete removes all their data (cascade), including plans that reference goals.
             db.Athletes.Remove(a);
             await db.SaveChangesAsync();
             Assert.Equal(0, await db.Activities.CountAsync());
             Assert.Equal(0, await db.TrainingPlans.CountAsync());
+            Assert.Equal(0, await db.LlmCalls.CountAsync());
+            Assert.Equal(0, await db.ReadinessChecks.CountAsync());
         }
     }
 
@@ -128,6 +136,31 @@ public class EndToEndTests(PostgresFixture pg)
     }
 
     [Fact]
+    public async Task A_failed_job_tells_the_athlete_why_and_how_to_run_it_now()
+    {
+        var time = new FakeTimeProvider(Start);
+        var notifier = new CapturingNotifier();
+        await using var sp = TestHost.Build(await pg.CreateDatabaseAsync(), time, notifier);
+        var jobs = new CronJobService(sp.GetRequiredService<IServiceScopeFactory>(), Options.Create(new JobsOptions()),
+            sp.GetRequiredService<IOptions<CoachOptions>>(), time, NullLogger<CronJobService>.Instance);
+        await using var scope = sp.CreateAsyncScope();
+        var athlete = await scope.ServiceProvider.GetRequiredService<AthleteService>().GetOrCreatePrimaryAsync(default);
+        var now = time.GetUtcNow();
+        scope.Db().Add(new CorosConnection { AthleteId = athlete.Id, McpUrl = "u", Issuer = "i", ClientId = "c", EncryptedRefreshToken = "t", CreatedAt = now, UpdatedAt = now });
+        await scope.Db().SaveChangesAsync();
+
+        var failing = new CoachJob("daily_check", Cronos.CronExpression.Parse("30 6 * * *"),
+            (_, _, _) => throw new LlmException("daily_check", LlmFailure.Timeout, "no answer"));
+        await jobs.RunAsync(failing, Start, default);
+
+        var run = await scope.Db().JobRuns.SingleAsync();
+        Assert.Equal("failed", run.Status);
+        var text = Assert.Single(notifier.Messages).Text;
+        Assert.Contains("/daily", text, StringComparison.Ordinal);
+        Assert.Contains("did not answer in time", text, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task Full_coaching_loop_with_fatigue_approval_symptom_pause_and_resume()
     {
         var time = new FakeTimeProvider(Start);
@@ -178,7 +211,8 @@ public class EndToEndTests(PostgresFixture pg)
             // Sat + Sun (before the plan started) and today's run. Older runs are recorded but never trigger adaptations.
             Assert.Equal(3, sync.NewRunIds.Count);
             var messagesBefore = notifier.Messages.Count;
-            await s.GetRequiredService<AnalysisService>().AnalyzeRunsAsync(athlete, sync.NewRunIds, default);
+            // Only today's run is recent enough to analyze.
+            Assert.Equal(1, await s.GetRequiredService<AnalysisService>().AnalyzePendingAsync(athlete, default));
             Assert.Equal(messagesBefore + 1, notifier.Messages.Count);
 
             var analysis = await scope.Db().RunAnalyses.SingleAsync(r => r.PlannedWorkoutId != null);

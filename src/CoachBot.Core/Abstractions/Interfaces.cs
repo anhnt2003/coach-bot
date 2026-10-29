@@ -18,6 +18,8 @@ public interface ICoachDb
     DbSet<PlanChange> PlanChanges { get; }
     DbSet<Alert> Alerts { get; }
     DbSet<JobRun> JobRuns { get; }
+    DbSet<LlmCall> LlmCalls { get; }
+    DbSet<ReadinessCheck> ReadinessChecks { get; }
 
     Task<int> SaveChangesAsync(CancellationToken cancellationToken = default);
 }
@@ -86,15 +88,44 @@ public sealed record WorkoutPushResult(bool Success, string? ExternalRef, string
 
 public interface ILlmClient
 {
-    bool IsEnabled { get; }
     string ProviderName { get; }
 
-    /// <summary>Returns the model's JSON output, or null when the provider is disabled or the call failed.</summary>
-    Task<string?> GenerateJsonAsync(LlmRequest request, CancellationToken ct);
+    /// <summary>Returns the model's JSON output (never empty) or throws <see cref="LlmException"/>.</summary>
+    Task<string> GenerateJsonAsync(LlmRequest request, CancellationToken ct);
 }
 
 /// <param name="JsonSchema">JSON Schema (draft 2020-12 subset) the response must follow.</param>
 public sealed record LlmRequest(string Purpose, string SystemPrompt, string UserPrompt, string JsonSchema);
+
+public enum LlmFailure
+{
+    Timeout,
+    Http,
+    Empty,
+    Schema,
+    Integrity,
+}
+
+/// <summary>The LLM did not produce a usable answer. There is no rule-based fallback: the operation fails.</summary>
+public sealed class LlmException(string purpose, LlmFailure reason, string detail, Exception? inner = null)
+    : Exception($"LLM {purpose} failed ({reason}): {detail}", inner)
+{
+    public string Purpose { get; } = purpose;
+    public LlmFailure Reason { get; } = reason;
+    public string Detail { get; } = detail;
+}
+
+/// <summary>Records every LLM call in llm_calls. Never throws.</summary>
+public interface ILlmCallLog
+{
+    Task RecordAsync(LlmCallRecord record, CancellationToken ct);
+}
+
+/// <param name="ContextJson">The context object the service gave the prompt, serialized (not the prompt text).</param>
+/// <param name="Response">Raw output of the model; null when nothing came back.</param>
+/// <param name="Failure">Null when the answer was used.</param>
+public sealed record LlmCallRecord(
+    Guid? AthleteId, string Purpose, string Model, string ContextJson, string? Response, LlmFailure? Failure, string? Error, int DurationMs);
 
 public interface IPromptLibrary
 {

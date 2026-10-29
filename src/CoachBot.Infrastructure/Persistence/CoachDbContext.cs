@@ -25,6 +25,8 @@ public sealed class CoachDbContext(DbContextOptions<CoachDbContext> options) : D
     public DbSet<PlanChange> PlanChanges => Set<PlanChange>();
     public DbSet<Alert> Alerts => Set<Alert>();
     public DbSet<JobRun> JobRuns => Set<JobRun>();
+    public DbSet<LlmCall> LlmCalls => Set<LlmCall>();
+    public DbSet<ReadinessCheck> ReadinessChecks => Set<ReadinessCheck>();
 
     protected override void ConfigureConventions(ModelConfigurationBuilder configurationBuilder)
     {
@@ -143,5 +145,19 @@ public sealed class CoachDbContext(DbContextOptions<CoachDbContext> options) : D
         });
 
         b.Entity<JobRun>(e => e.HasKey(x => new { x.JobName, x.RunKey }));
+
+        b.Entity<LlmCall>(e =>
+        {
+            e.HasKey(x => x.Id);
+            e.Property(x => x.ContextJson).HasColumnName("context").HasColumnType("jsonb");
+            e.HasOne<Athlete>().WithMany().HasForeignKey(x => x.AthleteId).OnDelete(DeleteBehavior.Cascade);
+        });
+
+        b.Entity<ReadinessCheck>(e =>
+        {
+            e.HasKey(x => new { x.AthleteId, x.Date });
+            e.Property(x => x.ConcernsJson).HasColumnName("concerns").HasColumnType("jsonb");
+            e.HasOne<Athlete>().WithMany().HasForeignKey(x => x.AthleteId).OnDelete(DeleteBehavior.Cascade);
+        });
     }
 }

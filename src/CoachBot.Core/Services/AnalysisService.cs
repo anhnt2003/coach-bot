@@ -22,20 +22,45 @@ public sealed class AnalysisService(
     TimeProvider time,
     ILogger<AnalysisService> logger)
 {
-    public async Task AnalyzeRunsAsync(Athlete athlete, IReadOnlyList<Guid> activityIds, CancellationToken ct)
+    /// <summary>Runs this recent without an analysis are analyzed on every sync; older ones never are.</summary>
+    public const int PendingWindowHours = 36;
+
+    /// <summary>
+    /// Analyzes every recent run that has no analysis yet, oldest first. A failed analysis writes nothing, so the run
+    /// is picked up again by the next sync; the athlete is told once per run.
+    /// </summary>
+    /// <returns>The number of runs analyzed.</returns>
+    public async Task<int> AnalyzePendingAsync(Athlete athlete, CancellationToken ct)
     {
-        var activities = await db.Activities.Where(a => activityIds.Contains(a.Id)).OrderBy(a => a.StartTime).ToListAsync(ct);
-        foreach (var activity in activities)
+        var since = time.GetUtcNow().AddHours(-PendingWindowHours);
+        var pending = await db.Activities
+            .Where(a => a.AthleteId == athlete.Id && a.Source == gateway.Source && a.StartTime >= since
+                        && Activity.RunSportTypes.Contains(a.SportType)
+                        && !db.RunAnalyses.Any(r => r.ActivityId == a.Id))
+            .OrderBy(a => a.StartTime)
+            .ToListAsync(ct);
+
+        var analyzed = 0;
+        foreach (var activity in pending)
         {
             try
             {
                 await AnalyzeRunAsync(athlete, activity, ct);
+                analyzed++;
             }
-            catch (Exception ex) when (ex is not OperationCanceledException)
+            catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
             {
-                logger.LogError(ex, "Analysis of activity {ActivityId} failed", activity.Id);
+                logger.LogError(ex, "Analysis of activity {ActivityId} failed; retried on the next sync", activity.Id);
+                var lang = athlete.Language;
+                var reason = ex is LlmException llmFailure ? fmt.T(lang, $"llm.reason.{llmFailure.Reason.ToString().ToLowerInvariant()}") : ex.Message;
+                await alerts.RaiseAsync(athlete.Id, AlertType.AnalysisFailure, AlertSeverity.Info,
+                    fmt.T(lang, "analysis.failed_retrying", MessageFormatter.Km(Math.Round(activity.DistanceKm, 1)),
+                        fmt.Day(lang, AthleteClock.LocalDate(activity.StartTime, athlete.TimeZone)), reason),
+                    $"analysis_failed:{activity.Id}", ct);
             }
         }
+
+        return analyzed;
     }
 
     public async Task<RunAnalysis?> AnalyzeRunAsync(Athlete athlete, Activity activity, CancellationToken ct)
@@ -84,7 +109,7 @@ public sealed class AnalysisService(
             var latestNotes = await db.Feedback.Where(f => f.AthleteId == athlete.Id && f.Notes != null)
                 .OrderByDescending(f => f.CreatedAt).Select(f => f.Notes).FirstOrDefaultAsync(ct);
             var planInputs = plan is null ? null : CoachJson.Deserialize<PlanSnapshot>(plan.InputsJson);
-            ai = await llm.AskAsync<RunAnalysisResponse>("run_analysis", new
+            ai = await llm.AskOrNullAsync<RunAnalysisResponse>("run_analysis", athlete.Id, new
             {
                 goal_distance_km = planInputs?.Zones.RaceKm,
                 diagnosis = planInputs?.Assessment is { } a ? new { a.Level, a.Limiters, a.Priorities } : null,

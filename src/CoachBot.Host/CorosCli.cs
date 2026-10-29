@@ -73,7 +73,7 @@ internal static class CorosCli
         return 0;
     }
 
-    /// <summary>Same as /sync [full] in Telegram: imports activities and daily metrics, then analyzes new runs. Read-only on COROS.</summary>
+    /// <summary>Same as /sync [full] in Telegram: imports activities and daily metrics, then analyzes recent runs. Read-only on COROS.</summary>
     private static async Task<int> SyncAsync(IServiceProvider sp, Athlete athlete, bool full, CancellationToken ct)
     {
         var result = full
@@ -85,8 +85,9 @@ internal static class CorosCli
             return 1;
         }
 
-        await sp.GetRequiredService<AnalysisService>().AnalyzeRunsAsync(athlete, result.NewRunIds, ct);
-        Console.WriteLine($"Imported {result.NewActivities} new activities ({result.NewRunIds.Count} runs) and {result.MetricDays} days of metrics.");
+        var analyzed = await sp.GetRequiredService<AnalysisService>().AnalyzePendingAsync(athlete, ct);
+        Console.WriteLine($"Imported {result.NewActivities} new activities ({result.NewRunIds.Count} runs) and {result.MetricDays} days of metrics; " +
+                          $"analyzed {analyzed} recent run(s).");
         return 0;
     }
 

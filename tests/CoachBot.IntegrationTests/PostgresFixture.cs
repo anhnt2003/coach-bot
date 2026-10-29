@@ -139,7 +139,7 @@ public static class TestHost
 {
     /// <summary>
     /// The real DI graph with test doubles only at the edges: fake clock, fake COROS data, capturing notifier, strict
-    /// text catalog.
+    /// text catalog and a scripted LLM (the real client is never called).
     /// </summary>
     public static ServiceProvider Build(string connectionString, FakeTimeProvider time, CapturingNotifier notifier, string scenario = "normal", ILlmClient? llm = null)
     {
@@ -150,7 +150,9 @@ public static class TestHost
             ["Coach:TimeZone"] = timeZone,
             ["Coach:Language"] = "en",
             ["Secrets:EncryptionKey"] = Convert.ToBase64String(new byte[32]),
-            ["Llm:Provider"] = "none",
+            ["Llm:Provider"] = "openai_compatible",
+            ["Llm:BaseUrl"] = "http://llm.test/v1",
+            ["Llm:Model"] = "scripted",
         }).Build();
 
         var services = new ServiceCollection();
@@ -160,10 +162,7 @@ public static class TestHost
         services.Replace(ServiceDescriptor.Singleton<INotifier>(notifier));
         services.Replace(ServiceDescriptor.Singleton<ITextCatalog>(new JsonTextCatalog(strict: true)));
         services.Replace(ServiceDescriptor.Scoped<ICorosGateway>(_ => new FakeCorosGateway(time, scenario, timeZone)));
-        if (llm is not null)
-        {
-            services.Replace(ServiceDescriptor.Singleton(llm));
-        }
+        services.Replace(ServiceDescriptor.Singleton(llm ?? new ScriptedLlm((_, _) => null)));
         FakeCorosGateway.PushedWorkouts.Clear();
         return services.BuildServiceProvider(new ServiceProviderOptions { ValidateScopes = true, ValidateOnBuild = true });
     }

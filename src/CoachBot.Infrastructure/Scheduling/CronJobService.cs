@@ -44,10 +44,11 @@ public sealed class CronJobService(
     [
         new("sync", CronExpression.Parse(options.Value.SyncCron), async (sp, athlete, ct) =>
         {
+            // COROS errors are handled (and alerted) inside SyncService; analysis also retries runs whose last analysis failed.
             var result = await sp.GetRequiredService<SyncService>().SyncAsync(athlete, SyncService.ActivityDays, SyncService.MetricDays, ct);
-            if (result.Success && result.NewRunIds.Count > 0)
+            if (result.Success)
             {
-                await sp.GetRequiredService<AnalysisService>().AnalyzeRunsAsync(athlete, result.NewRunIds, ct);
+                await sp.GetRequiredService<AnalysisService>().AnalyzePendingAsync(athlete, ct);
             }
         }),
         new("daily_check", CronExpression.Parse(options.Value.DailyCheckCron), async (sp, athlete, ct) =>
@@ -190,14 +191,49 @@ public sealed class CronJobService(
             run.Status = "failed";
             run.Error = ex.Message.Length > 1000 ? ex.Message[..1000] : ex.Message;
             logger.LogError(ex, "Job {Job} failed", job.Name);
+            await NotifyFailureAsync(sp, athlete, job, ex, ct);
         }
 
         run.FinishedAt = time.GetUtcNow();
         await db.SaveChangesAsync(CancellationToken.None);
     }
+
+    /// <summary>Command that runs a job by hand, offered when its scheduled run failed.</summary>
+    private static readonly Dictionary<string, string> RetryCommands = new()
+    {
+        ["sync"] = "/sync",
+        ["daily_check"] = "/daily",
+        ["weekly_report"] = "/report",
+        ["coros_push"] = "/push",
+    };
+
+    /// <summary>A failed job is not retried automatically: the athlete is told why and how to run it now.</summary>
+    private async Task NotifyFailureAsync(IServiceProvider sp, Athlete athlete, CoachJob job, Exception ex, CancellationToken ct)
+    {
+        try
+        {
+            var fmt = sp.GetRequiredService<MessageFormatter>();
+            var lang = athlete.Language;
+            var reason = ex is LlmException llm
+                ? fmt.T(lang, $"llm.reason.{llm.Reason.ToString().ToLowerInvariant()}")
+                : ex.Message.Length > 200 ? ex.Message[..200] : ex.Message;
+            var name = fmt.T(lang, $"job.name.{job.Name}");
+            var text = RetryCommands.TryGetValue(job.Name, out var command)
+                ? fmt.T(lang, "job.failed", name, reason, command)
+                : fmt.T(lang, "job.failed_no_retry", name, reason);
+            await sp.GetRequiredService<INotifier>().SendAsync(athlete.Id, new OutboundMessage(text), ct);
+        }
+        catch (Exception notifyError) when (!ct.IsCancellationRequested)
+        {
+            logger.LogError(notifyError, "Could not tell the athlete that job {Job} failed", job.Name);
+        }
+    }
 }
 
-/// <summary>Non-fatal startup diagnostics: database reachable, LLM configured.</summary>
+/// <summary>
+/// Non-fatal startup diagnostics: database reachable. The LLM configuration is validated on start, so the host does not
+/// start without it.
+/// </summary>
 public sealed class StartupChecks(IServiceScopeFactory scopes, IOptions<LlmOptions> llm, ILogger<StartupChecks> logger) : IHostedService
 {
     public async Task StartAsync(CancellationToken cancellationToken)
@@ -209,14 +245,7 @@ public sealed class StartupChecks(IServiceScopeFactory scopes, IOptions<LlmOptio
             logger.LogError("Database is not reachable; check ConnectionStrings__Postgres");
         }
 
-        if (llm.Value.Provider == "openai_compatible" && (string.IsNullOrWhiteSpace(llm.Value.BaseUrl) || string.IsNullOrWhiteSpace(llm.Value.Model)))
-        {
-            logger.LogError("Llm__Provider=openai_compatible needs Llm__BaseUrl and Llm__Model; analysis and reports use rule-based templates");
-        }
-        else if (llm.Value.Provider == "none")
-        {
-            logger.LogInformation("LLM disabled (Llm__Provider=none): analysis and reports use rule-based templates");
-        }
+        logger.LogInformation("LLM: model {Model} at {BaseUrl}", llm.Value.Model, llm.Value.BaseUrl);
     }
 
     public Task StopAsync(CancellationToken cancellationToken) => Task.CompletedTask;

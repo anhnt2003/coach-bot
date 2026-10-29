@@ -202,7 +202,7 @@ public sealed class ReportService(
         }
 
         var planInputs = plan is null ? null : CoachJson.Deserialize<PlanSnapshot>(plan.InputsJson);
-        var ai = await llm.AskAsync<WeeklyReportResponse>("weekly_report", new
+        var ai = await llm.AskOrNullAsync<WeeklyReportResponse>("weekly_report", athlete.Id, new
         {
             stats,
             phase = planned.FirstOrDefault()?.Phase,

@@ -58,6 +58,9 @@ public class CorosConnection
 
 public class Activity
 {
+    /// <summary>Sport types that count as running; a static list so database queries can filter on it.</summary>
+    public static readonly string[] RunSportTypes = ["run", "trail_run", "treadmill", "track"];
+
     public Guid Id { get; set; } = Guid.NewGuid();
     public Guid AthleteId { get; set; }
     public string Source { get; set; } = "";
@@ -77,7 +80,7 @@ public class Activity
     public DateTimeOffset ImportedAt { get; set; }
 
     public double DistanceKm => DistanceMeters / 1000.0;
-    public bool IsRun => SportType is "run" or "trail_run" or "treadmill" or "track";
+    public bool IsRun => RunSportTypes.Contains(SportType);
 }
 
 public class DailyMetric
@@ -236,6 +239,45 @@ public class JobRun
     public DateTimeOffset? FinishedAt { get; set; }
     public string Status { get; set; } = "running";
     public string? Error { get; set; }
+}
+
+/// <summary>One call to the LLM, kept for debugging: the LLM makes every coaching decision and its answers do not repeat.</summary>
+public class LlmCall
+{
+    public Guid Id { get; set; } = Guid.NewGuid();
+    public Guid? AthleteId { get; set; }
+    public string Purpose { get; set; } = "";
+    public string Model { get; set; } = "";
+
+    /// <summary>JSON: the context object the service gave the prompt.</summary>
+    public string ContextJson { get; set; } = "{}";
+
+    public string? Response { get; set; }
+
+    /// <summary>ok | timeout | http | empty | schema | integrity</summary>
+    public string Status { get; set; } = "ok";
+
+    public string? Error { get; set; }
+    public int DurationMs { get; set; }
+    public DateTimeOffset CreatedAt { get; set; }
+}
+
+/// <summary>The LLM's readiness verdict for one day, from the morning check or a run analysis.</summary>
+public class ReadinessCheck
+{
+    public Guid AthleteId { get; set; }
+    public DateOnly Date { get; set; }
+    public ReadinessLevel Level { get; set; }
+    public Confidence Confidence { get; set; }
+    public string Summary { get; set; } = "";
+
+    /// <summary>JSON array of strings.</summary>
+    public string ConcernsJson { get; set; } = "[]";
+
+    /// <summary>daily_check | run_analysis</summary>
+    public string Source { get; set; } = "";
+
+    public DateTimeOffset CreatedAt { get; set; }
 }
 
 /// <summary>One concrete edit to one planned workout. Serialized into <see cref="Recommendation.ChangesJson"/>.</summary>

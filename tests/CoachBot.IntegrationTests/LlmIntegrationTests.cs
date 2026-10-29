@@ -10,17 +10,22 @@ using Microsoft.Extensions.Time.Testing;
 
 namespace CoachBot.IntegrationTests;
 
-/// <summary>An LLM double that answers per prompt with scripted JSON, so the guardrails can be tested deterministically.</summary>
+/// <summary>
+/// An LLM double that answers per prompt with scripted JSON. A null answer behaves like a real failure: the call
+/// throws <see cref="LlmException"/>.
+/// </summary>
 public sealed class ScriptedLlm(Func<LlmRequest, JsonNode, string?> respond) : ILlmClient
 {
     public List<LlmRequest> Requests { get; } = [];
-    public bool IsEnabled => true;
     public string ProviderName => "scripted";
 
-    public Task<string?> GenerateJsonAsync(LlmRequest request, CancellationToken ct)
+    public Task<string> GenerateJsonAsync(LlmRequest request, CancellationToken ct)
     {
         Requests.Add(request);
-        return Task.FromResult(respond(request, Context(request)));
+        var answer = respond(request, Context(request));
+        return answer is null
+            ? throw new LlmException(request.Purpose, LlmFailure.Empty, "scripted: no answer")
+            : Task.FromResult(answer);
     }
 
     /// <summary>The prompts embed their data as a ```json block.</summary>

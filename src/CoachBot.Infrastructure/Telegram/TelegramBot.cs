@@ -1,5 +1,6 @@
 using CoachBot.Core.Abstractions;
 using CoachBot.Core.Domain;
+using CoachBot.Core.Services;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
@@ -89,6 +90,7 @@ public sealed class TelegramNotifier(TelegramClientHolder holder, ICoachDb db, I
 public sealed class TelegramBotService(
     TelegramClientHolder holder,
     IServiceScopeFactory scopes,
+    MessageFormatter fmt,
     ILogger<TelegramBotService> logger) : BackgroundService, IUpdateHandler
 {
     private static readonly BotCommand[] Commands =
@@ -145,13 +147,14 @@ public sealed class TelegramBotService(
         {
             await handler.HandleAsync(bot, update, ct);
         }
-        catch (Exception ex) when (ex is not OperationCanceledException)
+        catch (Exception ex) when (!ct.IsCancellationRequested)
         {
+            // A timeout is an OperationCanceledException too; only a shutdown should go unanswered.
             logger.LogError(ex, "Failed to handle Telegram update {UpdateId}", update.Id);
             long? chatId = update.Message?.Chat.Id ?? update.CallbackQuery?.Message?.Chat.Id;
             if (chatId is long id && handler.IsAllowed(id))
             {
-                await bot.SendMessage(id, "⚠️ Something went wrong handling that. It has been logged.", cancellationToken: ct);
+                await bot.SendMessage(id, fmt.T(handler.Language, "error.generic"), cancellationToken: ct);
             }
         }
     }
