@@ -2,7 +2,6 @@ using System.Text.Json.Nodes;
 using CoachBot.Core.Abstractions;
 using CoachBot.Core.Domain;
 using CoachBot.Core.Planning;
-using CoachBot.Core.Safety;
 using CoachBot.Core.Services;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
@@ -332,43 +331,73 @@ public class LlmIntegrationTests(PostgresFixture pg)
         Assert.Contains("checked", (await reports.TodayAsync(t.Athlete, default)).Text, StringComparison.Ordinal);
     }
 
+    private static ScriptedLlm Triage(string answer) => new((r, ctx) => r.Purpose == "symptom_triage" ? answer : ScriptedLlm.Default(r, ctx));
+
     [Fact]
-    public async Task Negated_keyword_asks_for_confirmation_instead_of_pausing()
+    public async Task Triage_can_ask_the_athlete_instead_of_pausing()
     {
-        var llm = new ScriptedLlm((r, ctx) => r.Purpose == "symptom_triage"
-            ? """{"category":"none","is_current":false,"evidence":"không hề đau ngực"}"""
-            : ScriptedLlm.Default(r, ctx));
-        await using var t = await SetupAsync(llm);
+        await using var t = await SetupAsync(Triage("""{"category":"cardiac","is_current":false,"action":"ask","evidence":"không hề đau ngực"}"""));
         var plan = await ActivePlanAsync(t);
+        var feedback = t.S.GetRequiredService<FeedbackService>();
 
-        var reply = await t.S.GetRequiredService<FeedbackService>().RecordNoteAsync(t.Athlete, "Hôm nay chạy ổn, không hề đau ngực hay chóng mặt", false, default);
+        var note = await feedback.SaveNoteAsync(t.Athlete, "Hôm nay chạy ổn, không hề đau ngực hay chóng mặt", default);
+        var reply = (await feedback.TriageAsync(t.Athlete, note.Id, false, default))!;
 
+        Assert.Contains("không hề đau ngực", reply.Text, StringComparison.Ordinal);
         var buttons = reply.Buttons!.SelectMany(b => b).Select(b => b.CallbackData).ToList();
-        Assert.Contains("sym:cardiac", buttons);
-        Assert.Contains("sym:none", buttons);
+        Assert.Equal(["sym:cardiac", "sym:none"], buttons);
         Assert.Equal(PlanStatus.Active, (await t.Scope.Db().TrainingPlans.SingleAsync(p => p.Id == plan.Id)).Status);
         Assert.False((await t.Scope.Db().Feedback.SingleAsync(f => f.Notes != null)).RedFlag);
 
-        // The athlete confirms after all: the plan is paused.
-        await t.S.GetRequiredService<FeedbackService>().ReportCategoryAsync(t.Athlete, SymptomCategory.Cardiac, default);
+        // The athlete confirms with the button: that pauses the plan without asking the LLM again.
+        var triageCalls = t.Scope.Db().LlmCalls.Count(c => c.Purpose == "symptom_triage");
+        await feedback.ReportCategoryAsync(t.Athlete, SymptomCategory.Cardiac, default);
         Assert.Equal(PlanStatus.Paused, (await t.Scope.Db().TrainingPlans.SingleAsync(p => p.Id == plan.Id)).Status);
+        Assert.Equal(triageCalls, t.Scope.Db().LlmCalls.Count(c => c.Purpose == "symptom_triage"));
     }
 
     [Fact]
-    public async Task Symptom_found_only_by_the_llm_pauses_immediately()
+    public async Task Triage_pause_pauses_the_plan_and_marks_the_note()
     {
-        var llm = new ScriptedLlm((r, ctx) => r.Purpose == "symptom_triage"
-            ? """{"category":"injury","is_current":true,"evidence":"đầu gối nhói khi xuống dốc"}"""
-            : ScriptedLlm.Default(r, ctx));
-        await using var t = await SetupAsync(llm);
+        await using var t = await SetupAsync(Triage("""{"category":"injury","is_current":true,"action":"pause","evidence":"đầu gối nhói khi xuống dốc"}"""));
         var plan = await ActivePlanAsync(t);
-        const string message = "Đầu gối trái nhói mỗi lần xuống dốc từ hôm qua";
-        Assert.False(SymptomDetector.Detect(message).IsRedFlag); // keywords alone would miss it
+        var feedback = t.S.GetRequiredService<FeedbackService>();
 
-        var reply = await t.S.GetRequiredService<FeedbackService>().RecordNoteAsync(t.Athlete, message, false, default);
+        var note = await feedback.SaveNoteAsync(t.Athlete, "Đầu gối trái nhói mỗi lần xuống dốc từ hôm qua", default);
+        var reply = (await feedback.TriageAsync(t.Athlete, note.Id, false, default))!;
 
         Assert.Contains("🛑", reply.Text, StringComparison.Ordinal);
         Assert.Equal(PlanStatus.Paused, (await t.Scope.Db().TrainingPlans.SingleAsync(p => p.Id == plan.Id)).Status);
-        Assert.Equal(SymptomCategory.Injury, (await t.Scope.Db().Feedback.SingleAsync(f => f.Notes != null)).Symptom);
+        var stored = await t.Scope.Db().Feedback.SingleAsync(f => f.Id == note.Id);
+        Assert.Equal((SymptomCategory.Injury, true), (stored.Symptom, stored.RedFlag));
+        Assert.Equal("injury: đầu gối nhói khi xuống dốc", (await t.Scope.Db().Alerts.SingleAsync(a => a.Type == AlertType.Symptom)).Message);
+    }
+
+    [Fact]
+    public async Task Nothing_serious_gets_an_answer_only_when_the_athlete_reported_a_symptom()
+    {
+        await using var t = await SetupAsync(new ScriptedLlm());
+        var feedback = t.S.GetRequiredService<FeedbackService>();
+
+        var note = await feedback.SaveNoteAsync(t.Athlete, "legs heavy after the long run", default);
+        Assert.Null(await feedback.TriageAsync(t.Athlete, note.Id, false, default));
+        Assert.Contains("Nothing in that looks like a red flag", (await feedback.TriageAsync(t.Athlete, note.Id, true, default))!.Text, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("""{"category":"none","is_current":true,"action":"pause","evidence":"x"}""")]
+    [InlineData("""{"category":"injury","is_current":true,"action":"stop","evidence":"x"}""")]
+    public async Task A_note_the_llm_cannot_read_stays_saved(string? answer)
+    {
+        await using var t = await SetupAsync(Triage(answer!));
+        var plan = await ActivePlanAsync(t);
+        var feedback = t.S.GetRequiredService<FeedbackService>();
+
+        var note = await feedback.SaveNoteAsync(t.Athlete, "chest feels tight", default);
+        await Assert.ThrowsAsync<LlmException>(() => feedback.TriageAsync(t.Athlete, note.Id, false, default));
+
+        Assert.Equal("chest feels tight", (await t.Scope.Db().Feedback.SingleAsync(f => f.Id == note.Id)).Notes);
+        Assert.Equal(PlanStatus.Active, (await t.Scope.Db().TrainingPlans.SingleAsync(p => p.Id == plan.Id)).Status);
     }
 }

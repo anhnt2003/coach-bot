@@ -191,7 +191,7 @@ public class EndToEndTests(PostgresFixture pg)
         var llm = new ScriptedLlm((r, ctx) => r.Purpose switch
         {
             "run_analysis" => Fatigued(ctx),
-            "symptom_triage" => """{"category":"cardiac","is_current":true,"evidence":"chest pain"}""",
+            "symptom_triage" => """{"category":"cardiac","is_current":true,"action":"pause","evidence":"chest pain"}""",
             _ => ScriptedLlm.Default(r, ctx),
         });
         await using var sp = TestHost.Build(await pg.CreateDatabaseAsync(), time, notifier, "fatigued", llm);
@@ -290,7 +290,8 @@ public class EndToEndTests(PostgresFixture pg)
             var athlete = await scope.Db().Athletes.SingleAsync();
             var feedback = s.GetRequiredService<FeedbackService>();
 
-            var reply = await feedback.RecordNoteAsync(athlete, "felt some chest pain near the end", false, default);
+            var note = await feedback.SaveNoteAsync(athlete, "felt some chest pain near the end", default);
+            var reply = (await feedback.TriageAsync(athlete, note.Id, false, default))!;
             Assert.Contains("🚨", reply.Text, StringComparison.Ordinal);
             Assert.Equal(PlanStatus.Paused, (await scope.Db().TrainingPlans.SingleAsync(p => p.Id == planId)).Status);
             Assert.True((await scope.Db().Feedback.OrderBy(f => f.CreatedAt).LastAsync()).RedFlag);

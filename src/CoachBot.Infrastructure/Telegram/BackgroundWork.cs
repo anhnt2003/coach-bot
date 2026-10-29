@@ -63,6 +63,12 @@ public sealed class BackgroundWork(
         return true;
     }
 
+    /// <summary>
+    /// What a job does, for its messages: the key up to the first ':'. A key can carry an id ("note:…") so that each
+    /// note gets its own job instead of waiting behind the previous one.
+    /// </summary>
+    public static string Kind(string key) => key.Split(':')[0];
+
     /// <summary>Completes when the job for this chat and key has finished; immediately when none runs.</summary>
     public Task WhenDone(long chatId, string key) => _running.TryGetValue((chatId, key), out var task) ? task : Task.CompletedTask;
 
@@ -84,7 +90,7 @@ public sealed class BackgroundWork(
             catch (LlmException ex)
             {
                 logger.LogWarning("Background {Key} for chat {ChatId} failed: LLM {Purpose} {Reason}", key, chatId, ex.Purpose, ex.Reason);
-                reply = new OutboundMessage(fmt.T(lang, $"llm.failed.{key}", fmt.T(lang, $"llm.reason.{ex.Reason.ToString().ToLowerInvariant()}")));
+                reply = new OutboundMessage(fmt.T(lang, $"llm.failed.{Kind(key)}", fmt.T(lang, $"llm.reason.{ex.Reason.ToString().ToLowerInvariant()}")));
             }
             catch (OperationCanceledException) when (_stopping.IsCancellationRequested)
             {
@@ -94,7 +100,7 @@ public sealed class BackgroundWork(
             catch (Exception ex)
             {
                 logger.LogError(ex, "Background {Key} for chat {ChatId} failed", key, chatId);
-                reply = new OutboundMessage(fmt.T(lang, "error.background", fmt.T(lang, $"work.{key}")));
+                reply = new OutboundMessage(fmt.T(lang, "error.background", fmt.T(lang, $"work.{Kind(key)}")));
             }
 
             if (reply is not null)

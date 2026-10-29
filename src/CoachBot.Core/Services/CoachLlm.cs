@@ -61,20 +61,6 @@ public sealed class CoachLlm(ILlmClient client, IPromptLibrary prompts, ILlmCall
         }
     }
 
-    /// <summary>Temporary bridge for services that still fall back to rules; removed once every caller handles failures.</summary>
-    public async Task<T?> AskOrNullAsync<T>(string promptName, Guid? athleteId, object context, string language, string jsonSchema, CancellationToken ct)
-        where T : class
-    {
-        try
-        {
-            return await AskAsync<T>(promptName, athleteId, context, language, jsonSchema, ct);
-        }
-        catch (LlmException)
-        {
-            return null;
-        }
-    }
-
     private int Elapsed(long started) => (int)time.GetElapsedTime(started).TotalMilliseconds;
 }
 
@@ -278,9 +264,10 @@ public static class LlmSchemas
           "properties": {
             "category": { "type": "string", "enum": ["none", "illness", "injury", "cardiac"] },
             "is_current": { "type": "boolean", "description": "true only if the athlete says they have/had this symptom recently (not negated, hypothetical, past and resolved, or about someone else)" },
+            "action": { "type": "string", "enum": ["none", "ask", "pause"] },
             "evidence": { "type": "string", "description": "the words in the message that support the decision" }
           },
-          "required": ["category", "is_current", "evidence"]
+          "required": ["category", "is_current", "action", "evidence"]
         }
         """;
 
@@ -308,7 +295,8 @@ public sealed record DailyCheckResponse(ReadinessDesign? Readiness, string? Advi
 
 public sealed record WeeklyReportResponse(string Summary, string? FocusNextWeek);
 
-public sealed record SymptomTriageResponse(string Category, bool IsCurrent, string? Evidence);
+/// <param name="Action">none: just a note; ask: ask the athlete to confirm; pause: pause the plan now.</param>
+public sealed record SymptomTriageResponse(string? Category, bool IsCurrent, string? Action, string? Evidence);
 
 /// <summary>The LLM's diagnosis of the athlete against the goal race; stored with the plan and shared with later prompts.</summary>
 /// <param name="PredictedRaceSeconds">The coach's race-time prediction; 0 or null when the data was too thin.</param>

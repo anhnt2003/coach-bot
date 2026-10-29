@@ -90,8 +90,6 @@
   "feedback.note_saved": "📝 Noted. Thanks!",
   "feedback.saved": "📝 Saved.",
   "feedback.rpe_saved": "Effort {0}/10 saved.",
-  "feedback.rpe_high": "Effort {0}/10 saved. That's high; I'll take it into account for the next days.",
-  "feedback.soreness_high": "Soreness noted. If it's sharp, localised or getting worse, use /symptom.",
   "feedback.unknown_activity": "I couldn't find that run.",
   "symptom.ask": "What's going on? (Not medical advice: if in doubt, see a doctor.)",
   "symptom.button.cardiac": "Chest pain / fainting / palpitations / unusual breathlessness",

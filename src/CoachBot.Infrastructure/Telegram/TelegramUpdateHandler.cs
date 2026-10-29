@@ -350,7 +350,7 @@ public sealed partial class TelegramUpdateHandler(
         });
         if (!accepted)
         {
-            await ReplyAsync(fmt.T(athlete.Language, "busy.running", fmt.T(athlete.Language, $"work.{key}")), ct);
+            await ReplyAsync(fmt.T(athlete.Language, "busy.running", fmt.T(athlete.Language, $"work.{BackgroundWork.Kind(key)}")), ct);
         }
     }
 
@@ -369,11 +369,14 @@ public sealed partial class TelegramUpdateHandler(
         return plans.RenderProposal(athlete, result.Plan, goal);
     }
 
-    private Task StartNoteAsync(Athlete athlete, string text, CancellationToken ct) =>
-        StartAsync(athlete, "note", null, (sp, a, token) => RecordNoteAsync(sp, a, text, false, token), ct);
-
-    private static async Task<OutboundMessage?> RecordNoteAsync(IServiceProvider sp, Athlete athlete, string text, bool explicitSymptomReport, CancellationToken ct) =>
-        await sp.GetRequiredService<FeedbackService>().RecordNoteAsync(athlete, text, explicitSymptomReport, ct);
+    /// <summary>Saves the note at once, then the LLM reads it in the background; it replies only when it finds a symptom.</summary>
+    private async Task StartNoteAsync(Athlete athlete, string text, CancellationToken ct)
+    {
+        var note = await feedback.SaveNoteAsync(athlete, text, ct);
+        await ReplyAsync(fmt.T(athlete.Language, "feedback.note_saved"), ct);
+        await StartAsync(athlete, $"note:{note.Id}", null,
+            (sp, a, token) => sp.GetRequiredService<FeedbackService>().TriageAsync(a, note.Id, false, token), ct);
+    }
 
     private async Task ApprovePlanAsync(Athlete athlete, Guid planId, CancellationToken ct)
     {
@@ -456,8 +459,9 @@ public sealed partial class TelegramUpdateHandler(
         var lang = athlete.Language;
         if (text.Length > 0)
         {
-            await StartAsync(athlete, "symptom", new OutboundMessage(fmt.T(lang, "queued.symptom")),
-                (sp, a, token) => RecordNoteAsync(sp, a, text, true, token), ct);
+            var note = await feedback.SaveNoteAsync(athlete, text, ct);
+            await StartAsync(athlete, $"symptom:{note.Id}", new OutboundMessage(fmt.T(lang, "queued.symptom")),
+                (sp, a, token) => sp.GetRequiredService<FeedbackService>().TriageAsync(a, note.Id, true, token), ct);
             return;
         }
 

@@ -90,8 +90,6 @@
   "feedback.note_saved": "📝 Đã ghi nhận. Cảm ơn bạn!",
   "feedback.saved": "📝 Đã lưu.",
   "feedback.rpe_saved": "Đã lưu mức gắng sức {0}/10.",
-  "feedback.rpe_high": "Đã lưu mức gắng sức {0}/10. Khá cao, mình sẽ tính đến cho các ngày tới.",
-  "feedback.soreness_high": "Đã ghi nhận đau mỏi. Nếu đau nhói, khu trú hoặc tăng dần, hãy dùng /symptom.",
   "feedback.unknown_activity": "Mình không tìm thấy buổi chạy đó.",
   "symptom.ask": "Bạn đang gặp vấn đề gì? (Không phải tư vấn y tế: nếu nghi ngờ, hãy đi khám.)",
   "symptom.button.cardiac": "Đau ngực / ngất / tim đập nhanh / khó thở bất thường",

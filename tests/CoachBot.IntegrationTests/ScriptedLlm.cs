@@ -143,7 +143,7 @@ public sealed class ScriptedLlm(Func<LlmRequest, JsonNode, string?> respond) : I
             ["advice"] = "Run today's session as planned.",
             ["changes"] = new JsonArray(),
         }.ToJsonString(),
-        "symptom_triage" => """{"category":"none","is_current":false,"evidence":""}""",
+        "symptom_triage" => """{"category":"none","is_current":false,"action":"none","evidence":""}""",
         "weekly_report" => """{"summary":"Solid week.","focus_next_week":"Keep easy runs easy."}""",
         _ => null,
     };

@@ -1,14 +1,13 @@
 using CoachBot.Core.Abstractions;
 using CoachBot.Core.Domain;
-using CoachBot.Core.Safety;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
 
 namespace CoachBot.Core.Services;
 
 /// <summary>
-/// Records athlete feedback and screens every free-text message for red-flag symptoms: a deterministic keyword
-/// detector plus (when enabled) an LLM that understands negation and context.
+/// Records athlete feedback. Every free-text message is read by the LLM, which decides whether it reports a symptom that
+/// should pause the plan. The /symptom buttons pause without the LLM: that is the athlete's own decision.
 /// </summary>
 public sealed class FeedbackService(
     ICoachDb db,
@@ -43,7 +42,7 @@ public sealed class FeedbackService(
         }
 
         await db.SaveChangesAsync(ct);
-        return new OutboundMessage(fmt.T(lang, rpe >= 8 ? "feedback.rpe_high" : "feedback.rpe_saved", feedback.Rpe));
+        return new OutboundMessage(fmt.T(lang, "feedback.rpe_saved", feedback.Rpe));
     }
 
     public async Task<OutboundMessage> RecordSorenessAsync(Athlete athlete, int soreness, CancellationToken ct)
@@ -56,62 +55,99 @@ public sealed class FeedbackService(
             CreatedAt = time.GetUtcNow(),
         });
         await db.SaveChangesAsync(ct);
-        return new OutboundMessage(fmt.T(athlete.Language, soreness >= 7 ? "feedback.soreness_high" : "feedback.saved"));
+        return new OutboundMessage(fmt.T(athlete.Language, "feedback.saved"));
     }
 
-    /// <summary>
-    /// Stores free text (notes, /feedback, /symptom) and screens it for red flags:
-    /// <list type="bullet">
-    /// <item>keyword hit, LLM unavailable or agreeing → pause immediately;</item>
-    /// <item>keyword hit, LLM says negated/not current ("no chest pain") → ask the athlete to confirm, no pause yet;</item>
-    /// <item>no keyword, LLM finds a current symptom → pause immediately.</item>
-    /// </list>
-    /// The LLM can never silently clear a keyword hit: the athlete always decides.
-    /// </summary>
-    public async Task<OutboundMessage> RecordNoteAsync(Athlete athlete, string text, bool explicitSymptomReport, CancellationToken ct)
+    /// <summary>Stores a free-text note before anyone reads it, so a failed triage loses nothing.</summary>
+    public async Task<AthleteFeedback> SaveNoteAsync(Athlete athlete, string text, CancellationToken ct)
     {
-        var lang = athlete.Language;
-        var keyword = SymptomDetector.Detect(text);
-        var triage = await llm.AskOrNullAsync<SymptomTriageResponse>("symptom_triage", athlete.Id, new
-        {
-            message = text,
-            keyword_matches = keyword.Matched,
-        }, lang, LlmSchemas.SymptomTriage, ct);
-        var llmCategory = triage is { IsCurrent: true } && Enum.TryParse<SymptomCategory>(triage.Category, ignoreCase: true, out var c) ? c : SymptomCategory.None;
-
-        var category = keyword.Category > llmCategory ? keyword.Category : llmCategory;
-        var needsConfirmation = keyword.IsRedFlag && triage is not null && llmCategory == SymptomCategory.None;
-
-        db.Feedback.Add(new AthleteFeedback
+        var note = new AthleteFeedback
         {
             AthleteId = athlete.Id,
             Date = AthleteClock.Today(time, athlete.TimeZone),
             Notes = text.Length > 2000 ? text[..2000] : text,
-            Symptom = needsConfirmation ? SymptomCategory.None : category,
-            RedFlag = !needsConfirmation && category != SymptomCategory.None,
             CreatedAt = time.GetUtcNow(),
-        });
+        };
+        db.Feedback.Add(note);
         await db.SaveChangesAsync(ct);
-
-        if (needsConfirmation)
-        {
-            logger.LogInformation("Keyword red flag ({Category}) but LLM judged it not current; asking the athlete to confirm", keyword.Category);
-            var cat = keyword.Category.ToString().ToLowerInvariant();
-            return new OutboundMessage(fmt.T(lang, "safety.confirm_symptom", string.Join(", ", keyword.Matched)),
-            [
-                [new MessageButton(fmt.T(lang, "symptom.button.yes_current"), $"sym:{cat}")],
-                [new MessageButton(fmt.T(lang, "symptom.button.not_current"), "sym:none")],
-            ]);
-        }
-
-        if (category == SymptomCategory.None)
-        {
-            return new OutboundMessage(fmt.T(lang, explicitSymptomReport ? "safety.no_red_flag" : "feedback.note_saved"));
-        }
-
-        var matched = keyword.IsRedFlag ? keyword.Matched : [$"llm: {triage?.Evidence}"];
-        return await HandleRedFlagAsync(athlete, new SymptomAssessment(category, matched), ct);
+        return note;
     }
+
+    /// <summary>
+    /// The LLM reads a saved note and decides: pause the plan for a current red-flag symptom, ask the athlete when it is
+    /// unsure, or nothing. Throws <see cref="LlmException"/> when the answer is unusable; the note stays saved.
+    /// </summary>
+    /// <param name="explicitSymptomReport">From /symptom: the athlete expects an answer even when it is nothing serious.</param>
+    /// <returns>The reply, or null when a plain note needs none.</returns>
+    public async Task<OutboundMessage?> TriageAsync(Athlete athlete, Guid feedbackId, bool explicitSymptomReport, CancellationToken ct)
+    {
+        var lang = athlete.Language;
+        var note = await db.Feedback.FirstOrDefaultAsync(f => f.Id == feedbackId && f.AthleteId == athlete.Id, ct);
+        if (note?.Notes is null)
+        {
+            return null;
+        }
+
+        var plan = await plans.GetCurrentPlanAsync(athlete.Id, ct);
+        var since = note.CreatedAt.AddDays(-14);
+        var recent = await db.Feedback
+            .Where(f => f.AthleteId == athlete.Id && f.Id != note.Id && f.Notes != null && f.CreatedAt >= since)
+            .OrderByDescending(f => f.CreatedAt).Take(5)
+            .Select(f => new { f.Date, text = f.Notes })
+            .ToListAsync(ct);
+
+        var triage = await llm.AskAsync<SymptomTriageResponse>("symptom_triage", athlete.Id, new
+        {
+            message = note.Notes,
+            plan_status = plan is null ? "none" : plan.Status == PlanStatus.Paused ? "paused" : "active",
+            recent_notes = recent,
+        }, lang, LlmSchemas.SymptomTriage, ct, TriageErrors);
+
+        var category = Category(triage.Category);
+        var evidence = triage.Evidence?.Trim() ?? "";
+        switch (triage.Action)
+        {
+            case "pause":
+                note.Symptom = category;
+                note.RedFlag = true;
+                await db.SaveChangesAsync(ct);
+                return await HandleRedFlagAsync(athlete, category, evidence, ct);
+            case "ask":
+                var cat = category.ToString().ToLowerInvariant();
+                return new OutboundMessage(fmt.T(lang, "safety.confirm_symptom", evidence),
+                [
+                    [new MessageButton(fmt.T(lang, "symptom.button.yes_current"), $"sym:{cat}")],
+                    [new MessageButton(fmt.T(lang, "symptom.button.not_current"), "sym:none")],
+                ]);
+            default:
+                return explicitSymptomReport ? new OutboundMessage(fmt.T(lang, "safety.no_red_flag")) : null;
+        }
+    }
+
+    private static readonly string[] TriageActions = ["none", "ask", "pause"];
+
+    private static IReadOnlyList<string> TriageErrors(SymptomTriageResponse t)
+    {
+        var errors = new List<string>();
+        if (!Enum.TryParse<SymptomCategory>(t.Category, ignoreCase: true, out var category) || !Enum.IsDefined(category))
+        {
+            errors.Add($"category_invalid: {t.Category ?? "null"}");
+        }
+        else if (t.Action is "pause" or "ask" && category == SymptomCategory.None)
+        {
+            errors.Add($"action_without_category: {t.Action} needs a symptom category");
+        }
+
+        if (!TriageActions.Contains(t.Action))
+        {
+            errors.Add($"action_invalid: {t.Action ?? "null"}");
+        }
+
+        return errors;
+    }
+
+    private static SymptomCategory Category(string? value) =>
+        Enum.TryParse<SymptomCategory>(value, ignoreCase: true, out var category) ? category : SymptomCategory.None;
 
     /// <summary>Quick-report buttons from /symptom.</summary>
     public Task<OutboundMessage> ReportCategoryAsync(Athlete athlete, SymptomCategory category, CancellationToken ct) =>
@@ -130,19 +166,19 @@ public sealed class FeedbackService(
             CreatedAt = time.GetUtcNow(),
         });
         await db.SaveChangesAsync(ct);
-        return await HandleRedFlagAsync(athlete, new SymptomAssessment(category, []), ct);
+        return await HandleRedFlagAsync(athlete, category, null, ct);
     }
 
-    private async Task<OutboundMessage> HandleRedFlagAsync(Athlete athlete, SymptomAssessment assessment, CancellationToken ct)
+    private async Task<OutboundMessage> HandleRedFlagAsync(Athlete athlete, SymptomCategory category, string? evidence, CancellationToken ct)
     {
         var lang = athlete.Language;
-        var category = assessment.Category.ToString().ToLowerInvariant();
-        var paused = await PauseAsync(athlete, $"symptom:{category}", ct);
-        var message = fmt.T(lang, $"safety.{category}") + "\n\n" + fmt.T(lang, paused ? "safety.plan_paused" : "safety.no_active_plan");
+        var cat = category.ToString().ToLowerInvariant();
+        var paused = await PauseAsync(athlete, $"symptom:{cat}", ct);
+        var message = fmt.T(lang, $"safety.{cat}") + "\n\n" + fmt.T(lang, paused ? "safety.plan_paused" : "safety.no_active_plan");
 
-        await alerts.RaiseAsync(athlete.Id, AlertType.Symptom, assessment.Category == SymptomCategory.Cardiac ? AlertSeverity.Critical : AlertSeverity.Warning,
-            $"{category}: {string.Join(", ", assessment.Matched)}", null, ct, send: false);
-        logger.LogWarning("Red-flag symptom reported ({Category}); plan paused={Paused}", category, paused);
+        await alerts.RaiseAsync(athlete.Id, AlertType.Symptom, category == SymptomCategory.Cardiac ? AlertSeverity.Critical : AlertSeverity.Warning,
+            string.IsNullOrWhiteSpace(evidence) ? cat : $"{cat}: {evidence}", null, ct, send: false);
+        logger.LogWarning("Red-flag symptom reported ({Category}); plan paused={Paused}", cat, paused);
         return new OutboundMessage(message);
     }
 
