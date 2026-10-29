@@ -9,16 +9,9 @@ public sealed class CorosOptions
 {
     public const string Section = "Coros";
 
-    /// <summary>"mock" (synthetic data, default) or "mcp" (official COROS MCP server).</summary>
-    [RegularExpression("^(mock|mcp)$")]
-    public string Mode { get; set; } = "mock";
-
     /// <summary>Regional endpoint: mcp (global), mcpeu, mcpus or mcpcn .coros.com/mcp.</summary>
     [Required]
     public string McpUrl { get; set; } = "https://mcp.coros.com/mcp";
-
-    [RegularExpression("^(normal|fatigued|missing_hrv|sparse_history)$")]
-    public string MockScenario { get; set; } = "normal";
 
     /// <summary>
     /// Automatic pushing of approved workouts to the COROS calendar. Off by default: enable only after

@@ -88,6 +88,9 @@ public sealed class CorosConnectService(
         return true;
     }
 
+    public Task<bool> IsConnectedAsync(Guid athleteId, CancellationToken ct) =>
+        db.CorosConnections.AnyAsync(c => c.AthleteId == athleteId && (c.EncryptedAccessToken != null || c.EncryptedRefreshToken != null), ct);
+
     public async Task DisconnectAsync(Guid athleteId, CancellationToken ct)
     {
         var connection = await db.CorosConnections.FirstOrDefaultAsync(c => c.AthleteId == athleteId, ct);

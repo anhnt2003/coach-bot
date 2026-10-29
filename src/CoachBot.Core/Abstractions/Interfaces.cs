@@ -24,7 +24,7 @@ public interface ICoachDb
 
 /// <summary>
 /// Source of training and health data, and target for pushing workouts.
-/// Implemented by the official COROS MCP adapter and by a mock adapter for development.
+/// Implemented by the official COROS MCP adapter.
 /// </summary>
 public interface ICorosGateway
 {

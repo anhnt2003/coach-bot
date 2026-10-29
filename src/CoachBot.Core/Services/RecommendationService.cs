@@ -299,9 +299,11 @@ public sealed class RecommendationService(
             return true;
         }
 
+        // Guidelines (session mix, spacing) are the coach's call; only enforced limits can block a change.
         var after = PlanAdjuster.Preview(plan.Workouts, changes, zones);
-        violations = new PlanValidator(safety.Value.ForRace(zones.RaceKm))
-            .ValidateAdaptation(plan.Workouts, after, zones, allowIncrease: changes.Any(IsIncrease));
+        violations = [.. new PlanValidator(safety.Value.ForRace(zones.RaceKm))
+            .ValidateAdaptation(plan.Workouts, after, zones, allowIncrease: changes.Any(IsIncrease))
+            .Where(v => !v.IsGuideline)];
         return violations.Count == 0;
     }
 

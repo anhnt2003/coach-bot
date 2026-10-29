@@ -18,6 +18,9 @@ public sealed class SyncService(
 {
     public const int FailureAlertThreshold = 3;
 
+    /// <summary>Regular sync window (days of activities / daily metrics); a full sync backfills enough history to plan from.</summary>
+    public const int ActivityDays = 3, MetricDays = 7, FullActivityDays = 56, FullMetricDays = 35;
+
     public async Task<SyncResult> SyncAsync(Athlete athlete, int activityDays, int metricDays, CancellationToken ct)
     {
         var today = AthleteClock.Today(time, athlete.TimeZone);

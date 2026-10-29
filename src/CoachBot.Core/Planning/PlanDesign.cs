@@ -33,10 +33,16 @@ public static class PlanDesignMapper
         var expectedWeeks = (PlanGenerator.MondayOf(raceDate).DayNumber - start.DayNumber) / 7 + 1;
         var weeks = design.Weeks ?? [];
 
+        // A missing or repeated week is reported against that week, so it can be repaired or replaced on its own. Weeks
+        // outside the plan window are ignored.
         var numbers = weeks.Select(w => w.Week).ToList();
-        if (numbers.Distinct().Count() != numbers.Count || !Enumerable.Range(1, expectedWeeks).SequenceEqual(numbers.Order()))
+        foreach (var number in Enumerable.Range(1, expectedWeeks))
         {
-            errors.Add(new("design_weeks_invalid", null, null, $"expected weeks 1..{expectedWeeks} exactly once, got [{string.Join(",", numbers)}]"));
+            var count = numbers.Count(n => n == number);
+            if (count != 1)
+            {
+                errors.Add(new("design_weeks_invalid", number - 1, null, $"week {number} given {count} times; expected weeks 1..{expectedWeeks} exactly once"));
+            }
         }
 
         foreach (var week in weeks.Where(w => w.Week >= 1 && w.Week <= expectedWeeks))

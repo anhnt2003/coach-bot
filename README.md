@@ -9,14 +9,18 @@ COROS calendar, and talks to you through Telegram (English or Vietnamese).
 
 > **The LLM coaches, the rules check.** The AI coach diagnoses your fitness against the goal, designs the plan and
 > its workouts (intervals, tempos, race-pace blocks, hills, strides — as structured steps), and proposes adjustments
-> after each run. Every proposal must pass deterministic safety rules tuned per race distance
-> ([docs/safety.md](docs/safety.md)) or it is discarded and the rule-based plan is used instead. Load increases always
+> after each run. Deterministic safety limits tuned per race distance ([docs/safety.md](docs/safety.md)) cover data
+> integrity and injury ceilings only: a plan week that exceeds them is cut down to them, while coaching heuristics
+> (session mix, 80/20, spacing) are guidelines the AI may go beyond with a reason. Load increases always
 > wait for your approval, paces always come from measured fitness, and symptom screening combines keywords with LLM
 > triage. Without an LLM, CoachBot runs entirely on the rules. Not medical advice.
 
 ## Running locally
 
-Prerequisites: .NET 10 SDK, Docker (Docker Desktop/OrbStack), [Supabase CLI](https://supabase.com/docs/guides/cli).
+Prerequisites: .NET 10 SDK, Docker (Docker Desktop/OrbStack), [Supabase CLI](https://supabase.com/docs/guides/cli),
+a COROS account and a Telegram bot. CoachBot only coaches from your real COROS data: there is no demo mode. Until
+COROS is connected, every command except `/start`, `/help`, `/language` and `/connect` (buttons and free text too)
+only asks you to connect, and the scheduled jobs are skipped.
 
 ```bash
 # 1. Database: local Supabase (applies supabase/migrations automatically)
@@ -26,6 +30,7 @@ supabase start
 cp .env.example .env
 #   - Secrets__EncryptionKey:  openssl rand -base64 32
 #   - Telegram__BotToken:      create a bot with @BotFather
+#   - Coros__McpUrl:           only if not global: https://mcpeu.coros.com/mcp (or mcpus / mcpcn)
 #   - LLM (optional):          see "LLM" below
 
 # 3. Run
@@ -33,19 +38,17 @@ dotnet run --project src/CoachBot.Host
 #   The first /start in Telegram replies with your chat id → set Telegram__AllowedChatId, restart, /start again.
 ```
 
-COROS runs in mock mode by default (`Coros__Mode=mock`): synthetic history and recovery data, no account needed.
-Mock scenarios: `Coros__MockScenario=normal | fatigued | missing_hrv | sparse_history` (restart after changing).
-
 Then in Telegram:
 
 ```text
+/connect            # required: open the link, approve in COROS → imports the last 8 weeks
 /goal 2027-03-07 3:59 Hanoi Marathon      # or: /goal 2026-12-20 half 1:45 · /goal 2026-11-29 5k 22:30
 /profile days=5 long=sun maxhr=188 lang=vi
-/sync full          # loads the last 8 weeks
 /plan               # review → ✅ Approve plan
 /today  /week  /status
-/mock_run 10        # mock mode only: simulates a finished 10 km run → analysis, RPE buttons, adaptations
 ```
+
+New runs are picked up by the hourly sync (or `/sync` right away), analysed, and may lead to proposed adjustments.
 
 ## LLM
 
@@ -56,7 +59,9 @@ Then in Telegram:
 
 For `openai_compatible` set `Llm__BaseUrl` (e.g. `https://api.openai.com/v1`, `http://localhost:11434/v1`),
 `Llm__Model` and, if the API needs one, `Llm__ApiKey`. The model must support JSON-schema structured output
-(`response_format: json_schema`). Requests are retried twice with `Llm__TimeoutSeconds` per attempt; any failure
+(`response_format: json_schema`). Answers are streamed, so a reasoning model can think for minutes without a proxy
+cutting the request. `Llm__TimeoutSeconds` bounds the wait for an answer to start and `Llm__TotalTimeoutSeconds`
+(default 900) the whole call; failed requests are retried twice (a proxy gateway timeout is not), and any failure
 falls back to the rules.
 
 ## Connecting COROS
@@ -64,11 +69,12 @@ falls back to the rules.
 CoachBot uses the **official COROS MCP server** (`https://mcp.coros.com/mcp`, regional `mcpeu` / `mcpus` / `mcpcn`).
 It registers itself as an OAuth client and you approve access in the browser; no COROS password is stored.
 
-Set `Coros__Mode=mcp` (and `Coros__McpUrl` for a regional endpoint), then connect from a terminal:
+Set `Coros__McpUrl` for a regional endpoint, then connect from a terminal:
 
 ```bash
 dotnet run --project src/CoachBot.Host -- coros login                  # approval link; waits for the redirect on localhost:8080
 dotnet run --project src/CoachBot.Host -- coros status                 # connection, token expiry, last sync
+dotnet run --project src/CoachBot.Host -- coros sync full              # imports 8 weeks of runs + 5 weeks of metrics (read-only)
 dotnet run --project src/CoachBot.Host -- coros discover               # saves raw tool schemas/outputs to .local/coros-fixtures/ (gitignored, personal data)
 dotnet run --project src/CoachBot.Host -- coros test-write 2026-11-05  # creates one test workout on that date
 ```
@@ -95,7 +101,6 @@ Details and COROS MCP limits: [docs/coros-integration.md](docs/coros-integration
 | `/connect` `/disconnect` | Connect or disconnect COROS |
 | `/feedback <text>` `/soreness 0-10` `/symptom [text]` | How you feel; any free-text message is also stored as feedback |
 | `/pause` `/resume` | Pause or resume the plan |
-| `/mock_run [km]` | Mock mode only: simulate a finished run |
 | `/help` | Command list |
 
 Feedback, symptom reports and free-text messages are screened for red-flag symptoms (English and Vietnamese); see
@@ -107,7 +112,7 @@ Interpreted in `Coach__TimeZone` (default `Asia/Ho_Chi_Minh`):
 
 | Job | Default (`Jobs__*Cron`) |
 | --- | --- |
-| COROS sync, post-run analysis and adaptations | every 3 hours |
+| COROS sync, post-run analysis and adaptations | hourly |
 | Daily readiness check | 06:30 |
 | Weekly report | Sunday 19:00 |
 | Push to COROS (when `Coros__EnableWorkoutPush=true`) | 20:00 |
@@ -123,8 +128,8 @@ runs and never committed; real environment variables override it.
 | `ConnectionStrings__Postgres` | Supabase Postgres connection string |
 | `Secrets__EncryptionKey` | AES-256-GCM key for COROS tokens at rest |
 | `Coach__*` | Time zone, default language, public base URL (COROS redirect), push window |
-| `Coros__*` | `mock` or `mcp`, MCP endpoint, mock scenario, workout push |
-| `Llm__*` | Provider, base URL, model, API key, timeout |
+| `Coros__*` | MCP endpoint, workout push |
+| `Llm__*` | Provider, base URL, model, API key, timeouts |
 | `Telegram__*` | Bot token, allowed chat id |
 | `Jobs__*` | Cron schedules |
 
@@ -132,7 +137,7 @@ runs and never committed; real environment variables override it.
 
 ```text
 src/CoachBot.Core            domain, safety rules, planning, analysis, application services (no I/O)
-src/CoachBot.Infrastructure  EF Core/Supabase, COROS MCP + mock adapters, OAuth, LLM client, Telegram, scheduler, i18n
+src/CoachBot.Infrastructure  EF Core/Supabase, COROS MCP adapter, OAuth, LLM client, Telegram, scheduler, i18n
 src/CoachBot.Host            ASP.NET Core host (/health, OAuth callback), CLI verbs (coros …, health)
 supabase/                    Supabase CLI project; migrations/*.sql are the schema source of truth
 tests/                       Core unit tests (incl. the plan-safety grid), infrastructure tests, integration tests
@@ -146,7 +151,9 @@ dotnet test
 ```
 
 Integration tests need a Postgres 17: they use `COACHBOT_TEST_DATABASE_URL` if set, else the local Supabase database
-(`supabase start`), else a Testcontainers `postgres:17-alpine`. Each test runs in its own throwaway database.
+(`supabase start`), else a Testcontainers `postgres:17-alpine`. Each test runs in its own throwaway database. They
+replace COROS with a synthetic test double (`tests/CoachBot.IntegrationTests/FakeCorosGateway.cs`), so they run
+offline; the app itself has no such mode.
 
 ## Deployment
 

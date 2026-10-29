@@ -137,16 +137,18 @@ public sealed class CapturingNotifier : INotifier
 
 public static class TestHost
 {
-    /// <summary>The real DI graph with test doubles only at the edges: fake clock, capturing notifier, strict text catalog.</summary>
+    /// <summary>
+    /// The real DI graph with test doubles only at the edges: fake clock, fake COROS data, capturing notifier, strict
+    /// text catalog.
+    /// </summary>
     public static ServiceProvider Build(string connectionString, FakeTimeProvider time, CapturingNotifier notifier, string scenario = "normal", ILlmClient? llm = null)
     {
+        const string timeZone = "Asia/Ho_Chi_Minh";
         var config = new ConfigurationBuilder().AddInMemoryCollection(new Dictionary<string, string?>
         {
             ["ConnectionStrings:Postgres"] = connectionString,
-            ["Coach:TimeZone"] = "Asia/Ho_Chi_Minh",
+            ["Coach:TimeZone"] = timeZone,
             ["Coach:Language"] = "en",
-            ["Coros:Mode"] = "mock",
-            ["Coros:MockScenario"] = scenario,
             ["Secrets:EncryptionKey"] = Convert.ToBase64String(new byte[32]),
             ["Llm:Provider"] = "none",
         }).Build();
@@ -157,12 +159,12 @@ public static class TestHost
         services.AddCoachBotCore(config);
         services.Replace(ServiceDescriptor.Singleton<INotifier>(notifier));
         services.Replace(ServiceDescriptor.Singleton<ITextCatalog>(new JsonTextCatalog(strict: true)));
+        services.Replace(ServiceDescriptor.Scoped<ICorosGateway>(_ => new FakeCorosGateway(time, scenario, timeZone)));
         if (llm is not null)
         {
             services.Replace(ServiceDescriptor.Singleton(llm));
         }
-        MockCorosGateway.ExtraActivities.Clear();
-        MockCorosGateway.PushedWorkouts.Clear();
+        FakeCorosGateway.PushedWorkouts.Clear();
         return services.BuildServiceProvider(new ServiceProviderOptions { ValidateScopes = true, ValidateOnBuild = true });
     }
 

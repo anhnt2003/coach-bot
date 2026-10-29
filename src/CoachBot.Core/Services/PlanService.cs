@@ -76,15 +76,16 @@ public sealed class PlanService(
             var notes = await db.Feedback.Where(f => f.AthleteId == athlete.Id && f.Notes != null && f.CreatedAt >= notesSince)
                 .OrderByDescending(f => f.CreatedAt).Select(f => f.Notes!).Take(10).ToListAsync(ct);
             assessment = await AssessAsync(athlete, goal, history, zones.Zones, draft, notes, warnings, ct);
-            var designed = await DesignWithLlmAsync(athlete, goal, history, zones.Zones, draft, constraints, validator, options, assessment, notes, warnings, ct);
+            var (designed, fallbackReason) = await DesignWithLlmAsync(athlete, goal, history, zones.Zones, draft, constraints, validator, options, assessment, notes, warnings, ct);
             if (designed is not null)
             {
-                (workouts, rationale, focus) = designed.Value;
+                (workouts, rationale, focus) = (designed.Workouts, designed.Rationale, designed.Focus);
+                warnings.AddRange(designed.Warnings.Except(warnings));
                 generatedBy = $"llm:{llm.ProviderName}";
             }
             else
             {
-                warnings.Add("plan.llm_rejected");
+                warnings.Add(fallbackReason!);
                 var explained = await ExplainRulePlanAsync(goal, history, zones.Zones, draft, warnings, lang, ct);
                 (rationale, focus) = (explained?.Rationale, explained?.WeeklyFocus);
             }
@@ -144,12 +145,17 @@ public sealed class PlanService(
         return new(plan, warnings, null);
     }
 
+    private sealed record DesignedPlan(
+        IReadOnlyList<PlannedWorkout> Workouts, string? Rationale, IReadOnlyList<WeeklyFocus> Focus, IReadOnlyList<string> Warnings);
+
     /// <summary>
-    /// Asks the LLM to design the plan, using the rule-based draft as a safe reference. The design must pass the same
-    /// validator as rule-based plans; on violations the LLM gets one chance to repair it. Returns null when no valid
-    /// design was produced (the caller then keeps the rule-based plan).
+    /// Asks the LLM to design the plan, using the rule-based draft as a safe reference. Only the validator's enforced
+    /// limits (data integrity, injury ceilings) can stop a design; guidelines it goes beyond become warnings. On enforced
+    /// violations the LLM gets one chance to repair it, and whatever still breaks a limit after that is clamped week by
+    /// week. Without a design the caller keeps the rule-based plan and shows the reason: "plan.llm_unavailable" (no usable
+    /// answer: timeout, provider error, malformed output) or "plan.llm_rejected" (the design could not be clamped).
     /// </summary>
-    private async Task<(IReadOnlyList<PlannedWorkout>, string?, IReadOnlyList<WeeklyFocus>)?> DesignWithLlmAsync(
+    private async Task<(DesignedPlan? Plan, string? FallbackReason)> DesignWithLlmAsync(
         Athlete athlete, RaceGoal goal, History history, TrainingZones zones, PlanDraft draft, PlanConstraints constraints,
         PlanValidator validator, SafetyOptions o, AthleteAssessment? assessment, IReadOnlyList<string> notes, IReadOnlyList<string> warnings,
         CancellationToken ct)
@@ -187,11 +193,25 @@ public sealed class PlanService(
                 weeks = draft.Workouts.Max(w => w.WeekIndex) + 1,
                 race_week = draft.Workouts.Max(w => w.WeekIndex) + 1,
             },
-            rules = new
+            // Enforced: a design that breaks these is repaired, then clamped.
+            limits = new
             {
                 weekly_increase_max = $"min({o.MaxWeeklyIncreasePct:P0}, +{o.MaxWeeklyIncreaseKm} km) over the previous full (non-cutback, non-taper) week; week 1 at most {draft.Baseline.WeeklyKm} km",
-                cutback = $"every {o.CutbackEveryWeeks}th week about {1 - o.CutbackFactor:P0} lower, marked cutback=true",
-                long_run = $"<= {o.LongRunHardMaxShare:P0} of the week, <= {o.LongRunCapKm} km and <= {o.LongRunCapMinutes} min, +{o.LongRunMaxIncreaseKm} km/week max; week 1 at most {draft.Baseline.LongRunKm} km",
+                cutback = "a week marked cutback=true must not be bigger than the previous full week",
+                long_run = $"<= {o.LongRunCapKm} km and <= {o.LongRunCapMinutes} min, +{o.LongRunMaxIncreaseKm} km/week max; week 1 at most {draft.Baseline.LongRunKm} km",
+                taper = $"taper weeks marked phase=taper (the baseline's are a safe choice), each lower than the previous and <= 85% of peak; race week <= {o.RaceWeekMaxShare:P0} of peak"
+                    + (draft.Workouts.Max(w => w.WeekIndex) >= 7 ? $", the week before it <= {o.PreRaceWeekMaxShare:P0} of peak" : ""),
+                easy_sessions = "recovery and easy runs contain only recovery/easy running, plus strides of <= 30 s or 200 m on easy runs",
+                steps = $"repeat 1..{WorkoutStructure.MaxRepeat}; recoveries at recovery, easy or steady; the steps make up the session distance",
+                run_days = $"at most {constraints.RunDaysPerWeek} run days per week, one session per day",
+                min_run_km = PlanValidator.MinRunKm,
+                race = $"one session type=race on {goal.RaceDate:yyyy-MM-dd} ({goal.RaceDate.DayOfWeek}), nothing after it",
+            },
+            // Advisory: sound defaults from coaching practice. Going beyond one is allowed when it serves this athlete.
+            guidelines = new
+            {
+                cutback_rhythm = $"every {o.CutbackEveryWeeks}th week about {1 - o.CutbackFactor:P0} lower",
+                long_run_share = $"<= {o.LongRunHardMaxShare:P0} of the week",
                 quality = $"tempo/interval/race_pace: <= {o.MaxQualityPerWeekBase} per week in base phase, <= {o.MaxQualityPerWeek} otherwise",
                 easy_share = $">= {o.MinEasyShare:P0} of weekly km easy. Sessions with steps count their steps (steady 50%, marathon pace and faster 100%); without steps tempo counts 50% hard, interval 40%, race_pace 60%",
                 intensity_per_session = new
@@ -203,49 +223,87 @@ public sealed class PlanService(
                 },
                 session_intensities = new
                 {
-                    recovery = "recovery, easy",
-                    easy = "recovery, easy, strides (at most 12 strides of <= 30 s or 200 m)",
                     @long = "recovery, easy, steady, marathon, half_marathon",
-                    tempo = "must include half_marathon, threshold or ten_k work; may add steady/marathon and strides",
-                    interval = "must include ten_k, five_k, repetition or hill work; recoveries at recovery/easy/steady",
-                    race_pace = $"must include work at {PlanDesignMapper.IntensityName(zones.RaceIntensity)} (the goal race pace)",
+                    tempo = "half_marathon, threshold or ten_k work; may add steady/marathon and strides",
+                    interval = "ten_k, five_k, repetition or hill work",
+                    race_pace = $"work at {PlanDesignMapper.IntensityName(zones.RaceIntensity)} (the goal race pace)",
+                    strides = $"at most {WorkoutStructure.MaxStrides} per session",
                 },
-                spacing = "no hard days back-to-back (long, tempo, interval, race_pace, race), also across weeks",
-                run_days = $"at most {constraints.RunDaysPerWeek} run days per week, one session per day",
-                min_run_km = 3,
-                taper = $"taper weeks marked phase=taper (the baseline's are a safe choice), each lower than the previous and <= 85% of peak; race week <= {o.RaceWeekMaxShare:P0} of peak; no hard session in the 2 days before the race",
-                race = $"one session type=race on {goal.RaceDate:yyyy-MM-dd} ({goal.RaceDate.DayOfWeek}), nothing after it",
+                spacing = "no hard days back-to-back (long, tempo, interval, race_pace, race), also across weeks; no hard session in the 2 days before the race",
             },
             baseline_plan = PlanDesignMapper.ToDesign(draft.Workouts),
         };
 
         var design = await llm.AskAsync<PlanDesign>("plan_design", context, athlete.Language, LlmSchemas.PlanDesign, ct);
-        for (var attempt = 1; design is not null; attempt++)
+        if (design is null)
         {
-            var (workouts, errors) = PlanDesignMapper.Map(design, draft.StartDate, goal.RaceDate, goal.DistanceKm, zones);
-            var violations = errors.Concat(validator.ValidatePlan(workouts, draft.Baseline, zones, constraints)).ToList();
-            if (violations.Count == 0)
-            {
-                var focus = (design.Weeks ?? []).Where(w => !string.IsNullOrWhiteSpace(w.Focus)).Select(w => new WeeklyFocus(w.Week, w.Focus!)).ToList();
-                return (workouts, design.Rationale, focus);
-            }
-
-            logger.LogWarning("LLM plan design attempt {Attempt} failed validation: {Violations}", attempt,
-                string.Join("; ", violations.Take(15).Select(v => $"{v.Code} w{v.WeekIndex + 1} {v.Detail}")));
-            if (attempt >= 2)
-            {
-                return null;
-            }
-
-            design = await llm.AskAsync<PlanDesign>("plan_design_repair", new
-            {
-                previous_design = design,
-                violations = violations.Select(v => new { v.Code, week = v.WeekIndex + 1, v.Date, v.Detail }),
-                context,
-            }, athlete.Language, LlmSchemas.PlanDesign, ct);
+            return (null, "plan.llm_unavailable");
         }
 
-        return null;
+        (List<PlannedWorkout> Workouts, List<Violation> Errors, List<Violation> Violations) Check(PlanDesign d)
+        {
+            var (mapped, errors) = PlanDesignMapper.Map(d, draft.StartDate, goal.RaceDate, goal.DistanceKm, zones);
+            return (mapped, errors, [.. errors, .. validator.ValidatePlan(mapped, draft.Baseline, zones, constraints)]);
+        }
+
+        static string Describe(IEnumerable<Violation> violations) =>
+            string.Join("; ", violations.Take(15).Select(v => $"{v.Code} w{v.WeekIndex + 1} {v.Detail}"));
+
+        var (workouts, designErrors, violations) = Check(design);
+        if (violations.Any(v => !v.IsGuideline))
+        {
+            logger.LogWarning("LLM plan design broke enforced limits: {Violations}", Describe(violations.Where(v => !v.IsGuideline)));
+            var repaired = await llm.AskAsync<PlanDesign>("plan_design_repair", new
+            {
+                previous_design = design,
+                violations = violations.Where(v => !v.IsGuideline).Select(v => new { v.Code, week = v.WeekIndex + 1, v.Date, v.Detail }),
+                guidelines_exceeded = violations.Where(v => v.IsGuideline).Select(v => new { v.Code, week = v.WeekIndex + 1, v.Date, v.Detail }),
+                context,
+            }, athlete.Language, LlmSchemas.PlanDesign, ct);
+            if (repaired is not null)
+            {
+                design = repaired;
+                (workouts, designErrors, violations) = Check(repaired);
+            }
+        }
+
+        IReadOnlyList<int> clamped = [], replaced = [];
+        if (violations.Any(v => !v.IsGuideline))
+        {
+            var result = PlanClamp.Apply(workouts, designErrors, draft, validator, zones, constraints);
+            if (result is null)
+            {
+                logger.LogWarning("LLM plan design could not be clamped to the limits: {Violations}", Describe(violations.Where(v => !v.IsGuideline)));
+                return (null, "plan.llm_rejected");
+            }
+
+            (workouts, clamped, replaced) = (result.Workouts, result.ClampedWeeks, result.ReplacedWeeks);
+            violations = [.. validator.ValidatePlan(workouts, draft.Baseline, zones, constraints)];
+            logger.LogInformation("LLM plan design clamped: weeks {Clamped} cut to the limits, weeks {Replaced} replaced by the baseline",
+                string.Join(",", clamped.Select(w => w + 1)), string.Join(",", replaced.Select(w => w + 1)));
+        }
+
+        var added = violations.Select(v => PlanValidator.GuidelineGroup(v.Code)).OfType<string>().Distinct().Select(g => $"plan.guideline.{g}").ToList();
+        if (added.Count > 0)
+        {
+            logger.LogInformation("LLM plan design goes beyond guidelines: {Violations}", Describe(violations));
+        }
+
+        if (clamped.Count > 0)
+        {
+            added.Add("plan.llm_clamped");
+        }
+
+        if (replaced.Count > 0)
+        {
+            added.Add("plan.llm_weeks_replaced");
+        }
+
+        var focus = (design.Weeks ?? [])
+            .Where(w => !string.IsNullOrWhiteSpace(w.Focus) && !replaced.Contains(w.Week - 1))
+            .Select(w => new WeeklyFocus(w.Week, w.Focus!))
+            .ToList();
+        return (new DesignedPlan(workouts, design.Rationale, focus, added), null);
     }
 
     private static string Cap(IntensityCap cap) => $"<= {cap.Share:P0} of the week's km per session (at least {cap.FloorKm} km allowed, never more than {cap.MaxKm} km)";

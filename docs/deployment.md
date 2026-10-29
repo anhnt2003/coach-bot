@@ -52,7 +52,7 @@ mapping in `CoachDbContext` must match, which `dotnet test` verifies against a r
 
 ## Operations
 
-- **Scheduled jobs** (time zone `Coach__TimeZone`): sync every 3 h, daily check 06:30, weekly report Sunday 19:00,
+- **Scheduled jobs** (time zone `Coach__TimeZone`): sync hourly, daily check 06:30, weekly report Sunday 19:00,
   COROS push 20:00, proposal expiry hourly. Each run is recorded in `coach.job_runs`, so a restart never runs a slot
   twice; missed slots within 6 h are caught up at startup.
 - **Alerts:** repeated sync failures, expired/revoked COROS access, fatigue and symptoms are stored in `coach.alerts`

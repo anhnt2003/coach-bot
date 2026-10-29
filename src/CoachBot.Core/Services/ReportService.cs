@@ -45,7 +45,7 @@ public sealed class ReportService(
         return new OutboundMessage(sb.ToString().TrimEnd());
     }
 
-    public async Task<OutboundMessage> StatusAsync(Athlete athlete, string corosMode, CancellationToken ct)
+    public async Task<OutboundMessage> StatusAsync(Athlete athlete, CancellationToken ct)
     {
         var lang = athlete.Language;
         var goal = await athletes.GetActiveGoalAsync(athlete.Id, ct);
@@ -61,12 +61,10 @@ public sealed class ReportService(
         sb.AppendLine(plan is null ? fmt.T(lang, "status.no_plan") : fmt.T(lang, "status.plan", plan.Version, fmt.T(lang, $"plan.status.{plan.Status.ToString().ToLowerInvariant()}")));
         sb.AppendLine(fmt.T(lang, "status.profile", athlete.RunDaysPerWeek, MessageFormatter.Culture(lang).DateTimeFormat.GetDayName(athlete.LongRunDay),
             athlete.MaxHr?.ToString(CultureInfo.InvariantCulture) ?? "–"));
-        sb.AppendLine(corosMode == "mock"
-            ? fmt.T(lang, "status.coros_mock")
-            : connection?.EncryptedRefreshToken is null && connection?.EncryptedAccessToken is null
-                ? fmt.T(lang, "status.coros_disconnected")
-                : fmt.T(lang, "status.coros_connected", connection.LastSyncAt?.ToString("yyyy-MM-dd HH:mm", CultureInfo.InvariantCulture) ?? "–",
-                    connection.LastSyncError is null ? "OK" : connection.LastSyncError));
+        sb.AppendLine(connection is not { IsConnected: true }
+            ? fmt.T(lang, "status.coros_disconnected")
+            : fmt.T(lang, "status.coros_connected", connection.LastSyncAt?.ToString("yyyy-MM-dd HH:mm", CultureInfo.InvariantCulture) ?? "–",
+                connection.LastSyncError is null ? "OK" : connection.LastSyncError));
         sb.AppendLine(fmt.T(lang, "status.last_activity", lastActivity is null ? "–" : fmt.Day(lang, AthleteClock.LocalDate(lastActivity.Value, athlete.TimeZone))));
         if (pending > 0)
         {

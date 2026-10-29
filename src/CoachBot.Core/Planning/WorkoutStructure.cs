@@ -178,7 +178,11 @@ public static class WorkoutStructure
             {
                 if (!allowed.Contains(intensity))
                 {
-                    problems.Add(new("steps_intensity_not_allowed", $"{intensity} in {type}"));
+                    // Hard work hidden in an easy run defeats every load check keyed on session type; in a quality
+                    // session an unusual intensity is a coaching choice.
+                    problems.Add(type is WorkoutType.Easy or WorkoutType.Recovery
+                        ? new("steps_intensity_not_allowed", $"{intensity} in {type}")
+                        : new("steps_intensity_unusual", $"{intensity} in {type}"));
                 }
             }
 

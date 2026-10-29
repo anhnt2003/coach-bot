@@ -4,8 +4,10 @@ using CoachBot.Core.Planning;
 using CoachBot.Core.Safety;
 using CoachBot.Core.Services;
 using CoachBot.Infrastructure.Coros;
+using CoachBot.Infrastructure.Scheduling;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using Microsoft.Extensions.Time.Testing;
 
@@ -22,7 +24,7 @@ public class SchemaMappingTests(PostgresFixture pg)
         var now = time.GetUtcNow();
         var athlete = new Athlete { Name = "A", TelegramChatId = 42, MaxHr = 188, BirthYear = 1990, LongRunDay = DayOfWeek.Saturday, CreatedAt = now };
         var goal = new RaceGoal { AthleteId = athlete.Id, Name = "Hanoi", RaceDate = new DateOnly(2027, 3, 7), GoalTimeSeconds = 14400, CreatedAt = now };
-        var activity = new Activity { AthleteId = athlete.Id, Source = "mock", ExternalId = "x1", StartTime = now, DurationSeconds = 3600, DistanceMeters = 10000, RawJson = """{"a":1}""", ImportedAt = now };
+        var activity = new Activity { AthleteId = athlete.Id, Source = "fake", ExternalId = "x1", StartTime = now, DurationSeconds = 3600, DistanceMeters = 10000, RawJson = """{"a":1}""", ImportedAt = now };
         var plan = new TrainingPlan { AthleteId = athlete.Id, RaceGoalId = goal.Id, Version = 1, Status = PlanStatus.Active, StartDate = new DateOnly(2026, 10, 26), EndDate = goal.RaceDate, InputsJson = "{}", CreatedAt = now };
         var workout = new PlannedWorkout { PlanId = plan.Id, Date = new DateOnly(2026, 10, 27), Phase = PlanPhase.Build, Type = WorkoutType.RacePace, TargetDistanceKm = 12, Title = "MP", CompletedActivityId = activity.Id, CorosSyncStatus = SyncStatus.ManualActionRequired, UpdatedAt = now };
         plan.Workouts.Add(workout);
@@ -34,7 +36,7 @@ public class SchemaMappingTests(PostgresFixture pg)
             var db = scope.Db();
             db.AddRange(athlete, goal, activity, plan, analysis, rec);
             db.Add(new CorosConnection { AthleteId = athlete.Id, McpUrl = "u", Issuer = "i", ClientId = "c", CapabilitiesJson = """["a"]""", CreatedAt = now, UpdatedAt = now });
-            db.Add(new DailyMetric { AthleteId = athlete.Id, Date = new DateOnly(2026, 10, 21), HrvMs = 55.5, Vo2Max = 48.2, Source = "mock", UpdatedAt = now });
+            db.Add(new DailyMetric { AthleteId = athlete.Id, Date = new DateOnly(2026, 10, 21), HrvMs = 55.5, Vo2Max = 48.2, Source = "fake", UpdatedAt = now });
             db.Add(new AthleteFeedback { AthleteId = athlete.Id, ActivityId = activity.Id, Date = new DateOnly(2026, 10, 21), Rpe = 7, Symptom = SymptomCategory.Injury, RedFlag = true, CreatedAt = now });
             db.Add(new PlanChange { PlanId = plan.Id, PlannedWorkoutId = workout.Id, RecommendationId = rec.Id, BeforeJson = "{}", AfterJson = "{}", Reason = "r", AppliedBy = "auto", AppliedAt = now });
             db.Add(new Alert { AthleteId = athlete.Id, Type = AlertType.Fatigue, Severity = AlertSeverity.Warning, Message = "m", DedupKey = "k", CreatedAt = now });
@@ -105,6 +107,27 @@ public class EndToEndTests(PostgresFixture pg)
     }
 
     [Fact]
+    public async Task Scheduled_jobs_wait_until_coros_is_connected()
+    {
+        var time = new FakeTimeProvider(Start);
+        await using var sp = TestHost.Build(await pg.CreateDatabaseAsync(), time, new CapturingNotifier());
+        var jobs = new CronJobService(sp.GetRequiredService<IServiceScopeFactory>(), Options.Create(new JobsOptions()),
+            sp.GetRequiredService<IOptions<CoachOptions>>(), time, NullLogger<CronJobService>.Instance);
+        var syncJob = jobs.Jobs.Single(j => j.Name == "sync");
+        await using var scope = sp.CreateAsyncScope();
+        var athlete = await scope.ServiceProvider.GetRequiredService<AthleteService>().GetOrCreatePrimaryAsync(default);
+
+        await jobs.RunAsync(syncJob, Start, default);
+        Assert.False(await scope.Db().Activities.AnyAsync());
+
+        var now = time.GetUtcNow();
+        scope.Db().Add(new CorosConnection { AthleteId = athlete.Id, McpUrl = "u", Issuer = "i", ClientId = "c", EncryptedRefreshToken = "t", CreatedAt = now, UpdatedAt = now });
+        await scope.Db().SaveChangesAsync();
+        await jobs.RunAsync(syncJob, Start.AddHours(1), default);
+        Assert.True(await scope.Db().Activities.AnyAsync());
+    }
+
+    [Fact]
     public async Task Full_coaching_loop_with_fatigue_approval_symptom_pause_and_resume()
     {
         var time = new FakeTimeProvider(Start);
@@ -113,7 +136,7 @@ public class EndToEndTests(PostgresFixture pg)
         Guid athleteId;
         Guid planId;
 
-        // 1. Onboarding: goal, history backfill, plan proposal, approval, push to (mock) COROS.
+        // 1. Onboarding: goal, history backfill, plan proposal, approval, push to (fake) COROS.
         await using (var scope = sp.CreateAsyncScope())
         {
             var s = scope.ServiceProvider;
@@ -141,7 +164,7 @@ public class EndToEndTests(PostgresFixture pg)
             Assert.NotNull((await plans.ApproveAsync(athlete.Id, plan.Id, default)).Plan);
             var push = await s.GetRequiredService<CorosPushService>().PushUpcomingAsync(athlete, default);
             Assert.True(push.Pushed >= 1);
-            Assert.Equal(push.Pushed, MockCorosGateway.PushedWorkouts.Count);
+            Assert.Equal(push.Pushed, FakeCorosGateway.PushedWorkouts.Count);
         }
 
         // 2. Tuesday of week 1, after the morning run: fatigue for three days → deload proposal (major, needs approval).
@@ -249,7 +272,7 @@ public class EndToEndTests(PostgresFixture pg)
             var reports = s.GetRequiredService<ReportService>();
             Assert.NotNull(await reports.DailyCheckAsync(athlete, default));
             Assert.NotNull(await reports.WeeklyReportAsync(athlete, default));
-            Assert.Contains("v1", (await reports.StatusAsync(athlete, "mock", default)).Text, StringComparison.Ordinal);
+            Assert.Contains("v1", (await reports.StatusAsync(athlete, default)).Text, StringComparison.Ordinal);
             Assert.NotEmpty((await reports.TodayAsync(athlete, default)).Text);
             Assert.True(await scope.Db().PlannedWorkouts.AnyAsync(w => w.Status == WorkoutStatus.Missed));
         }

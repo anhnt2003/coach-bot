@@ -1,5 +1,6 @@
 using System.Globalization;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
@@ -10,7 +11,7 @@ namespace CoachBot.Infrastructure.Coros;
 /// adapter's mappings are based on real responses. Output contains personal data and is written to a gitignored folder.
 /// Write tools are never called here.
 /// </summary>
-public sealed class CorosDiscovery(CorosMcpSession session, IOptions<CorosOptions> options, TimeProvider time, ILogger<CorosDiscovery> logger)
+public sealed partial class CorosDiscovery(CorosMcpSession session, IOptions<CorosOptions> options, TimeProvider time, ILogger<CorosDiscovery> logger)
 {
     // Read-only tools, in call order (activities first so detail tools can reuse an activity id).
     private static readonly string[] ReadTools =
@@ -86,46 +87,18 @@ public sealed class CorosDiscovery(CorosMcpSession session, IOptions<CorosOption
         return CorosToolArgs.Build(schema, desired, out missing);
     }
 
-    /// <summary>Remembers the first activity id/sport type seen, for activity-detail tools.</summary>
+    /// <summary>Remembers the first activity's ids from the sport-records text ("LabelId: … | SportType: 100"), for activity-detail tools.</summary>
     private static void CollectIds(JsonElement payload, Dictionary<string, object?> known)
     {
-        foreach (var (key, value) in Walk(payload))
+        if (payload.ValueKind == JsonValueKind.String && !known.ContainsKey("labelId") && ActivityIds().Match(payload.GetString()!) is { Success: true } m)
         {
-            if (key is "labelId" && !known.ContainsKey("labelId"))
-            {
-                known["labelId"] = value.ValueKind == JsonValueKind.String ? value.GetString() : value.ToString();
-            }
-            else if (key is "sportType" && !known.ContainsKey("sportType") && value.TryGetInt32(out var sport))
-            {
-                known["sportType"] = sport;
-            }
+            known["labelId"] = m.Groups["id"].Value;
+            known["sportType"] = int.Parse(m.Groups["sport"].Value, CultureInfo.InvariantCulture);
         }
     }
 
-    private static IEnumerable<(string Key, JsonElement Value)> Walk(JsonElement e)
-    {
-        if (e.ValueKind == JsonValueKind.Object)
-        {
-            foreach (var p in e.EnumerateObject())
-            {
-                yield return (p.Name, p.Value);
-                foreach (var inner in Walk(p.Value))
-                {
-                    yield return inner;
-                }
-            }
-        }
-        else if (e.ValueKind == JsonValueKind.Array)
-        {
-            foreach (var item in e.EnumerateArray())
-            {
-                foreach (var inner in Walk(item))
-                {
-                    yield return inner;
-                }
-            }
-        }
-    }
+    [GeneratedRegex(@"LabelId:\s*(?<id>\d+)\s*\|\s*SportType:\s*(?<sport>\d+)")]
+    private static partial Regex ActivityIds();
 
     /// <summary>Structure only (keys and array sizes), so console output does not echo health values.</summary>
     private static string Shape(JsonElement e) => e.ValueKind switch

@@ -8,6 +8,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Telegram.Bot;
+using Telegram.Bot.Exceptions;
 using Telegram.Bot.Types;
 
 namespace CoachBot.Infrastructure.Telegram;
@@ -15,7 +16,6 @@ namespace CoachBot.Infrastructure.Telegram;
 /// <summary>Routes Telegram commands, free text and button callbacks to the application services. Scoped per update.</summary>
 public sealed partial class TelegramUpdateHandler(
     IOptions<TelegramOptions> telegram,
-    IOptions<CorosOptions> coros,
     IOptions<CoachOptions> coach,
     AthleteService athletes,
     PlanService plans,
@@ -34,8 +34,6 @@ public sealed partial class TelegramUpdateHandler(
     private ITelegramBotClient _bot = null!;
     private long _chatId;
 
-    private bool IsMock => coros.Value.Mode == "mock";
-
     public bool IsAllowed(long chatId) => telegram.Value.AllowedChatId == chatId;
 
     public async Task HandleAsync(ITelegramBotClient bot, Update update, CancellationToken ct)
@@ -49,7 +47,17 @@ public sealed partial class TelegramUpdateHandler(
         else if (update.CallbackQuery is { Data: { } data, Message: { } source } callback)
         {
             _chatId = source.Chat.Id;
-            await bot.AnswerCallbackQuery(callback.Id, cancellationToken: ct);
+            try
+            {
+                await bot.AnswerCallbackQuery(callback.Id, cancellationToken: ct);
+            }
+            catch (ApiRequestException ex)
+            {
+                // Only stops the button's spinner. A tap made while the bot was offline is too old to answer,
+                // but the action itself must still run.
+                logger.LogDebug("Could not answer callback query: {Message}", ex.Message);
+            }
+
             if (IsAllowed(_chatId))
             {
                 await OnCallbackAsync(data, source.MessageId, ct);
@@ -94,11 +102,20 @@ public sealed partial class TelegramUpdateHandler(
         }
 
         var lang = athlete.Language;
+        // The coach works from COROS data only: until COROS is connected, every other command asks for /connect.
+        var connected = await connect.IsConnectedAsync(athlete.Id, ct);
+        var isRedirect = command is null && text.Contains("/oauth/coros/callback?", StringComparison.Ordinal);
+        if (!connected && !isRedirect && command is not ("/start" or "/help" or "/connect" or "/language"))
+        {
+            await ReplyAsync(fmt.T(lang, "connect.required"), ct);
+            return;
+        }
+
         switch (command)
         {
             case "/start":
             case "/help":
-                await ReplyAsync(fmt.T(lang, "help") + "\n\n" + fmt.T(lang, "disclaimer"), ct);
+                await ReplyAsync(fmt.T(lang, "help") + "\n\n" + fmt.T(lang, "disclaimer") + (connected ? "" : "\n\n" + fmt.T(lang, "connect.required")), ct);
                 break;
             case "/goal":
                 await GoalAsync(athlete, rest, ct);
@@ -130,7 +147,7 @@ public sealed partial class TelegramUpdateHandler(
                 await ReplyAsync(await reports.DailyCheckAsync(athlete, ct) ?? new OutboundMessage(fmt.T(lang, "report.nothing")), ct);
                 break;
             case "/status":
-                await ReplyAsync(await reports.StatusAsync(athlete, coros.Value.Mode, ct), ct);
+                await ReplyAsync(await reports.StatusAsync(athlete, ct), ct);
                 break;
             case "/report":
                 await ReplyAsync(await reports.WeeklyReportAsync(athlete, ct) ?? new OutboundMessage(fmt.T(lang, "report.nothing")), ct);
@@ -163,10 +180,7 @@ public sealed partial class TelegramUpdateHandler(
             case "/resume":
                 await ReplyAsync(await feedback.RequestResumeAsync(athlete, ct), ct);
                 break;
-            case "/mock_run" when IsMock:
-                await MockRunAsync(athlete, rest, ct);
-                break;
-            case null when text.Contains("/oauth/coros/callback?", StringComparison.Ordinal):
+            case null when isRedirect:
                 await CompleteConnectAsync(athlete, text, ct);
                 break;
             case null:
@@ -183,6 +197,13 @@ public sealed partial class TelegramUpdateHandler(
     {
         var athlete = await athletes.GetOrCreatePrimaryAsync(ct);
         var lang = athlete.Language;
+        if (!await connect.IsConnectedAsync(athlete.Id, ct))
+        {
+            // Buttons stay, so they can be tapped again once COROS is connected.
+            await ReplyAsync(fmt.T(lang, "connect.required"), ct);
+            return;
+        }
+
         var p = data.Split(':');
 
         async Task ClearButtonsAsync() => await _bot.EditMessageReplyMarkup(_chatId, messageId, null, cancellationToken: ct);
@@ -340,7 +361,9 @@ public sealed partial class TelegramUpdateHandler(
     private async Task SyncAsync(Athlete athlete, bool full, CancellationToken ct)
     {
         var lang = athlete.Language;
-        var result = await sync.SyncAsync(athlete, full ? 56 : 3, full ? 35 : 7, ct);
+        var result = full
+            ? await sync.SyncAsync(athlete, SyncService.FullActivityDays, SyncService.FullMetricDays, ct)
+            : await sync.SyncAsync(athlete, SyncService.ActivityDays, SyncService.MetricDays, ct);
         if (!result.Success)
         {
             await ReplyAsync(fmt.T(lang, "sync.failed", result.Error), ct);
@@ -366,12 +389,6 @@ public sealed partial class TelegramUpdateHandler(
     private async Task ConnectAsync(Athlete athlete, CancellationToken ct)
     {
         var lang = athlete.Language;
-        if (IsMock)
-        {
-            await ReplyAsync(fmt.T(lang, "connect.mock_mode"), ct);
-            return;
-        }
-
         // Verified live: COROS only grants authorization_code (+PKCE) to dynamically registered clients, no device flow.
         var url = await connect.StartBrowserLoginAsync(athlete.Id, ct);
         await ReplyAsync(fmt.T(lang, "connect.browser", url), ct);
@@ -414,15 +431,5 @@ public sealed partial class TelegramUpdateHandler(
             [new MessageButton(fmt.T(lang, "symptom.button.illness"), "sym:illness")],
             [new MessageButton(fmt.T(lang, "symptom.button.none"), "sym:none")],
         ]), ct);
-    }
-
-    /// <summary>Dev helper (mock mode only): records a run finished an hour ago and runs the post-run pipeline.</summary>
-    private async Task MockRunAsync(Athlete athlete, string args, CancellationToken ct)
-    {
-        var km = double.TryParse(args, NumberStyles.Float, CultureInfo.InvariantCulture, out var k) && k is > 0 and < 60 ? k : 10;
-        var start = time.GetUtcNow().AddHours(-1);
-        MockCorosGateway.ExtraActivities[$"mock-extra-{start:yyyyMMddHHmm}"] = new ActivitySample(
-            $"mock-extra-{start:yyyyMMddHHmm}", "run", start, (int)(km * 375), km * 1000, 375, 148, 168, 30, 172, Math.Round(km * 6), "Mock run (/mock_run)", null);
-        await SyncAsync(athlete, full: false, ct);
     }
 }

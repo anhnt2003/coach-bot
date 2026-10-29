@@ -1,6 +1,8 @@
-Your previous plan design broke the safety rules listed in "violations" (codes with week numbers, dates and details). Return a corrected FULL plan design (all weeks) that fixes every violation while keeping your personalisation where possible.
+Your previous plan design broke the safety limits listed in "violations" (codes with week numbers, dates and details). Return a corrected FULL plan design (all weeks) that fixes every violation while keeping your personalisation where possible. Whatever still breaks a limit is cut down by the application, week by week, or replaced by the baseline's week.
 
-Typical fixes: shorten or split a main set that exceeds an intensity limit ("too_much_*"), move a faster intensity into a session type that allows it ("steps_intensity_not_allowed"), add the required main set ("steps_missing_main_set"), lower a week's volume, or move a hard session so hard days are not back-to-back. If unsure, move closer to "baseline_plan" inside "context", which satisfies every rule.
+Typical fixes: lower a week's volume or its long run to the progression limit ("volume_increase_too_large", "long_run_increase_too_large"), make taper weeks smaller ("taper_*", "race_week_not_tapered"), move faster work out of an easy run into a tempo/interval/race_pace session ("steps_intensity_not_allowed"), make the steps add up to the session, use only known days, types and intensities, or drop a session to respect the run days. If unsure, move closer to "baseline_plan" inside "context", which stays within every limit.
+
+"guidelines_exceeded" lists coaching guidelines your design goes beyond. They are not violations: keep them if they were deliberate (and explained in the rationale), otherwise adjust.
 
 Data (JSON):
 ```json

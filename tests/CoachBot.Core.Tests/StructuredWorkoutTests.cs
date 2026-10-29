@@ -51,6 +51,17 @@ public class StructuredWorkoutTests
     {
         var problems = WorkoutStructure.Problems(WorkoutType.Easy, FiveByOneK, Intensity.HalfMarathon);
         Assert.Contains(problems, p => p.Code == "steps_intensity_not_allowed");
+        Assert.Null(PlanValidator.GuidelineGroup("steps_intensity_not_allowed"));
+    }
+
+    [Fact]
+    public void Unusual_intensity_in_a_quality_session_is_only_a_guideline()
+    {
+        // 5K-pace surges in a long run: unusual, but a coaching choice rather than hidden load.
+        var problems = WorkoutStructure.Problems(WorkoutType.Long, [new(1, new(Intensity.Easy, Km: 14)), .. FiveByOneK], Intensity.HalfMarathon);
+        var problem = Assert.Single(problems);
+        Assert.Equal("steps_intensity_unusual", problem.Code);
+        Assert.Equal("structure", PlanValidator.GuidelineGroup(problem.Code));
     }
 
     [Fact]

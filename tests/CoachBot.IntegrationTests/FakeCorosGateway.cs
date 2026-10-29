@@ -2,29 +2,22 @@ using System.Collections.Concurrent;
 using CoachBot.Core.Abstractions;
 using CoachBot.Core.Domain;
 using CoachBot.Core.Services;
-using Microsoft.Extensions.Options;
 
-namespace CoachBot.Infrastructure.Coros;
+namespace CoachBot.IntegrationTests;
 
 /// <summary>
-/// Deterministic synthetic COROS data for development and tests. Clearly labelled "mock" in the database
-/// (activities.source / daily_metrics.source) so it can never be mistaken for real data.
+/// Deterministic synthetic COROS data, so the integration tests run offline. Stored with source "fake".
 /// Scenarios: normal, fatigued (last 3 days: HRV down, RHR up, poor sleep), missing_hrv (no HRV/sleep),
 /// sparse_history (only ~10 days of runs, no fitness assessment).
 /// </summary>
-public sealed class MockCorosGateway(TimeProvider time, IOptions<CorosOptions> options, IOptions<CoachOptions> coach) : ICorosGateway
+public sealed class FakeCorosGateway(TimeProvider time, string scenario, string timeZone) : ICorosGateway
 {
-    /// <summary>Runs added at runtime (e.g. the /mock_run dev command) on top of the generated history.</summary>
-    public static ConcurrentDictionary<string, ActivitySample> ExtraActivities { get; } = new();
-
-    /// <summary>Workouts "pushed" to the mock calendar, keyed by date + title.</summary>
+    /// <summary>Workouts "pushed" to the fake calendar, keyed by COROS reference.</summary>
     public static ConcurrentDictionary<string, PlannedWorkout> PushedWorkouts { get; } = new();
 
-    public string Source => "mock";
+    public string Source => "fake";
 
-    private string Scenario => options.Value.MockScenario;
-
-    private DateOnly Today => AthleteClock.Today(time, coach.Value.TimeZone);
+    private DateOnly Today => AthleteClock.Today(time, timeZone);
 
     public Task<CorosCapabilities> GetCapabilitiesAsync(Guid athleteId, CancellationToken ct) =>
         Task.FromResult(new CorosCapabilities(
@@ -33,9 +26,9 @@ public sealed class MockCorosGateway(TimeProvider time, IOptions<CorosOptions> o
 
     public Task<IReadOnlyList<ActivitySample>> GetActivitiesAsync(Guid athleteId, DateOnly from, DateOnly to, CancellationToken ct)
     {
-        var zone = AthleteClock.Zone(coach.Value.TimeZone);
+        var zone = AthleteClock.Zone(timeZone);
         var nowLocal = TimeZoneInfo.ConvertTime(time.GetUtcNow(), zone);
-        var earliest = Scenario == "sparse_history" ? Today.AddDays(-10) : DateOnly.MinValue;
+        var earliest = scenario == "sparse_history" ? Today.AddDays(-10) : DateOnly.MinValue;
         var result = new List<ActivitySample>();
 
         for (var d = from; d <= to; d = d.AddDays(1))
@@ -52,10 +45,10 @@ public sealed class MockCorosGateway(TimeProvider time, IOptions<CorosOptions> o
                 continue;
             }
 
-            var fatigued = Scenario == "fatigued" && d > Today.AddDays(-3);
+            var fatigued = scenario == "fatigued" && d > Today.AddDays(-3);
             var pace = 360 - (int)(Noise(d, 7) * 20) + (fatigued ? 15 : 0);
             result.Add(new ActivitySample(
-                ExternalId: $"mock-{d:yyyyMMdd}",
+                ExternalId: $"fake-{d:yyyyMMdd}",
                 SportType: "run",
                 StartTime: start.ToUniversalTime(),
                 DurationSeconds: (int)(km * pace),
@@ -66,11 +59,10 @@ public sealed class MockCorosGateway(TimeProvider time, IOptions<CorosOptions> o
                 ElevationGainM: 40,
                 AvgCadence: 172,
                 TrainingLoad: Math.Round(km * 6 * (fatigued ? 1.3 : 1.0)),
-                Name: "Mock run",
+                Name: "Fake run",
                 RawJson: null));
         }
 
-        result.AddRange(ExtraActivities.Values.Where(a => DateOnly.FromDateTime(a.StartTime.UtcDateTime) >= from.AddDays(-1)));
         return Task.FromResult<IReadOnlyList<ActivitySample>>(result);
     }
 
@@ -79,8 +71,8 @@ public sealed class MockCorosGateway(TimeProvider time, IOptions<CorosOptions> o
         var result = new List<DailyMetricSample>();
         for (var d = from; d <= to && d <= Today; d = d.AddDays(1))
         {
-            var fatigued = Scenario == "fatigued" && d > Today.AddDays(-3);
-            var noHrv = Scenario == "missing_hrv";
+            var fatigued = scenario == "fatigued" && d > Today.AddDays(-3);
+            var noHrv = scenario == "missing_hrv";
             result.Add(new DailyMetricSample(
                 Date: d,
                 RestingHr: 49 + (int)(Noise(d, 11) * 3) + (fatigued ? 9 : 0),
@@ -96,14 +88,14 @@ public sealed class MockCorosGateway(TimeProvider time, IOptions<CorosOptions> o
     }
 
     public Task<FitnessSnapshot?> GetFitnessAsync(Guid athleteId, CancellationToken ct) =>
-        Task.FromResult(Scenario == "sparse_history"
+        Task.FromResult(scenario == "sparse_history"
             ? null
             : new FitnessSnapshot(Vo2Max: 48, ThresholdPaceSecPerKm: 330, MarathonPredictionSeconds: 4 * 3600 + 5 * 60,
                 HalfMarathonPredictionSeconds: 1 * 3600 + 58 * 60, LactateThresholdHr: 168, RawJson: null));
 
     public Task<WorkoutPushResult> PushScheduledWorkoutAsync(Guid athleteId, PlannedWorkout workout, CancellationToken ct)
     {
-        var key = workout.CorosRef ?? $"mock-workout-{workout.Id:N}";
+        var key = workout.CorosRef ?? $"fake-workout-{workout.Id:N}";
         PushedWorkouts[key] = PlanAdjuster.Clone(workout);
         return Task.FromResult(new WorkoutPushResult(true, key, null));
     }

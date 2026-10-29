@@ -1,3 +1,4 @@
+using System.Net;
 using CoachBot.Core.Abstractions;
 using CoachBot.Core.Services;
 using CoachBot.Infrastructure.Coros;
@@ -9,12 +10,15 @@ using CoachBot.Infrastructure.Telegram;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Http.Resilience;
 using Microsoft.Extensions.Options;
 
 namespace CoachBot.Infrastructure;
 
 public static class DependencyInjection
 {
+    private const HttpStatusCode CloudflareTimeout = (HttpStatusCode)524;
+
     public static IServiceCollection AddCoachBotCore(this IServiceCollection services, IConfiguration config)
     {
         services.AddOptions<CoachOptions>().Bind(config.GetSection(CoachOptions.Section)).ValidateDataAnnotations().ValidateOnStart();
@@ -53,7 +57,7 @@ public static class DependencyInjection
         services.AddScoped<CoachLlm>();
         services.AddSingleton<MessageFormatter>();
 
-        AddCoros(services, config);
+        AddCoros(services);
         AddLlm(services, config);
         services.AddSingleton<ITextCatalog>(sp => new JsonTextCatalog(sp.GetService<Microsoft.Extensions.Logging.ILogger<JsonTextCatalog>>()));
 
@@ -81,13 +85,16 @@ public static class DependencyInjection
         services.AddOptions<LlmOptions>().Bind(config.GetSection(LlmOptions.Section)).ValidateDataAnnotations().ValidateOnStart();
         services.AddSingleton<IPromptLibrary, EmbeddedPromptLibrary>();
 
-        var timeout = int.TryParse(config.GetSection(LlmOptions.Section)["TimeoutSeconds"], out var t) ? t : new LlmOptions().TimeoutSeconds;
+        var limits = config.GetSection(LlmOptions.Section).Get<LlmOptions>() ?? new LlmOptions();
         void Resilience(IHttpClientBuilder b) => b.AddStandardResilienceHandler(o =>
         {
-            o.AttemptTimeout.Timeout = TimeSpan.FromSeconds(timeout);
-            o.CircuitBreaker.SamplingDuration = TimeSpan.FromSeconds(timeout * 2.5);
-            o.TotalRequestTimeout.Timeout = TimeSpan.FromSeconds(timeout * 2.5);
+            o.AttemptTimeout.Timeout = TimeSpan.FromSeconds(limits.TimeoutSeconds);
+            o.CircuitBreaker.SamplingDuration = limits.TotalTimeout;
+            o.TotalRequestTimeout.Timeout = limits.TotalTimeout;
             o.Retry.MaxRetryAttempts = 2;
+            // A proxy's gateway timeout (Cloudflare 524) comes back for the same long request, so a retry only adds minutes.
+            o.Retry.ShouldHandle = args => ValueTask.FromResult(
+                args.Outcome.Result?.StatusCode != CloudflareTimeout && HttpClientResiliencePredicates.IsTransient(args.Outcome));
         });
 
         Resilience(services.AddHttpClient<OpenAiCompatibleLlmClient>(c => c.Timeout = Timeout.InfiniteTimeSpan));
@@ -100,7 +107,7 @@ public static class DependencyInjection
         });
     }
 
-    private static void AddCoros(IServiceCollection services, IConfiguration config)
+    private static void AddCoros(IServiceCollection services)
     {
         services.AddSingleton<TokenCipher>();
         services.AddSingleton<PendingBrowserLogins>();
@@ -110,13 +117,8 @@ public static class DependencyInjection
         services.AddScoped<CorosMcpSession>();
         services.AddScoped<CorosConnectService>();
         services.AddScoped<CorosDiscovery>();
-        services.AddScoped<MockCorosGateway>();
         services.AddScoped<CorosMcpGateway>();
-
-        var mode = config.GetSection(CorosOptions.Section)["Mode"] ?? "mock";
-        services.AddScoped<ICorosGateway>(sp => mode == "mcp"
-            ? sp.GetRequiredService<CorosMcpGateway>()
-            : sp.GetRequiredService<MockCorosGateway>());
+        services.AddScoped<ICorosGateway>(sp => sp.GetRequiredService<CorosMcpGateway>());
     }
 
     private static void TryAddTimeProvider(this IServiceCollection services)

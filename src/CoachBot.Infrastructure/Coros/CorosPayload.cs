@@ -33,7 +33,9 @@ public static class CorosToolArgs
             }
             else if (required.Contains(prop.Name))
             {
-                if (AllowsNull(prop.Value))
+                // COROS lists every filter as required (strict-schema style) but describes unused ones as "Optional":
+                // those are sent as null.
+                if (AllowsNull(prop.Value) || IsDeclaredOptional(prop.Value))
                 {
                     args[prop.Name] = null;
                 }
@@ -79,148 +81,15 @@ public static class CorosToolArgs
     private static bool AllowsNull(JsonElement prop) =>
         prop.TryGetProperty("type", out var t) &&
         (t.ValueKind == JsonValueKind.Array ? t.EnumerateArray().Any(x => x.GetString() == "null") : t.GetString() == "null");
+
+    private static bool IsDeclaredOptional(JsonElement prop) =>
+        prop.TryGetProperty("description", out var d) && d.ValueKind == JsonValueKind.String
+        && d.GetString()!.TrimStart().StartsWith("Optional", StringComparison.OrdinalIgnoreCase);
 }
 
-/// <summary>
-/// Tolerant readers for COROS MCP tool output. UNVERIFIED against live responses: field names are candidates taken
-/// from COROS documentation and common conventions. Raw payloads are stored alongside mapped values, and
-/// `coros discover` captures real responses to confirm or fix these mappings.
-/// </summary>
+/// <summary>Log helpers for COROS MCP payloads.</summary>
 public static class CorosPayload
 {
-    /// <summary>All objects found in arrays anywhere in the payload (tool outputs usually wrap lists in an envelope).</summary>
-    public static IEnumerable<JsonElement> Items(JsonElement payload)
-    {
-        if (payload.ValueKind == JsonValueKind.Array)
-        {
-            foreach (var item in payload.EnumerateArray())
-            {
-                if (item.ValueKind == JsonValueKind.Object)
-                {
-                    yield return item;
-                }
-
-                foreach (var nested in Items(item))
-                {
-                    yield return nested;
-                }
-            }
-        }
-        else if (payload.ValueKind == JsonValueKind.Object)
-        {
-            foreach (var p in payload.EnumerateObject())
-            {
-                foreach (var nested in Items(p.Value))
-                {
-                    yield return nested;
-                }
-            }
-        }
-    }
-
-    public static JsonElement? Field(JsonElement obj, params string[] names)
-    {
-        if (obj.ValueKind != JsonValueKind.Object)
-        {
-            return null;
-        }
-
-        foreach (var p in obj.EnumerateObject())
-        {
-            if (names.Any(n => string.Equals(n, p.Name, StringComparison.OrdinalIgnoreCase)) && p.Value.ValueKind is not (JsonValueKind.Null or JsonValueKind.Undefined))
-            {
-                return p.Value;
-            }
-        }
-
-        return null;
-    }
-
-    public static double? Number(JsonElement obj, params string[] names)
-    {
-        var v = Field(obj, names);
-        return v?.ValueKind switch
-        {
-            JsonValueKind.Number => v.Value.GetDouble(),
-            JsonValueKind.String when double.TryParse(v.Value.GetString(), NumberStyles.Float, CultureInfo.InvariantCulture, out var d) => d,
-            _ => null,
-        };
-    }
-
-    public static string? Text(JsonElement obj, params string[] names)
-    {
-        var v = Field(obj, names);
-        return v?.ValueKind switch
-        {
-            JsonValueKind.String => v.Value.GetString(),
-            JsonValueKind.Number => v.Value.GetRawText(),
-            _ => null,
-        };
-    }
-
-    /// <summary>Accepts yyyyMMdd (number or string), yyyy-MM-dd, or an ISO timestamp.</summary>
-    public static DateOnly? Date(JsonElement obj, params string[] names)
-    {
-        var raw = Text(obj, names);
-        if (raw is null)
-        {
-            return null;
-        }
-
-        if (DateOnly.TryParseExact(raw, "yyyyMMdd", CultureInfo.InvariantCulture, DateTimeStyles.None, out var compact))
-        {
-            return compact;
-        }
-
-        if (DateOnly.TryParseExact(raw, "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out var iso))
-        {
-            return iso;
-        }
-
-        return DateTimeOffset.TryParse(raw, CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal, out var ts) ? DateOnly.FromDateTime(ts.Date) : null;
-    }
-
-    /// <summary>Accepts epoch seconds, epoch milliseconds or an ISO-8601 string.</summary>
-    public static DateTimeOffset? Instant(JsonElement obj, params string[] names)
-    {
-        var v = Field(obj, names);
-        if (v is null)
-        {
-            return null;
-        }
-
-        if (v.Value.ValueKind == JsonValueKind.Number && v.Value.TryGetInt64(out var epoch))
-        {
-            return epoch > 100_000_000_000 ? DateTimeOffset.FromUnixTimeMilliseconds(epoch) : DateTimeOffset.FromUnixTimeSeconds(epoch);
-        }
-
-        var s = v.Value.GetString();
-        if (long.TryParse(s, NumberStyles.Integer, CultureInfo.InvariantCulture, out var e))
-        {
-            return e > 100_000_000_000 ? DateTimeOffset.FromUnixTimeMilliseconds(e) : DateTimeOffset.FromUnixTimeSeconds(e);
-        }
-
-        return DateTimeOffset.TryParse(s, CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal, out var ts) ? ts.ToUniversalTime() : null;
-    }
-
-    /// <summary>Pace as seconds per km, from a number or "m:ss" text.</summary>
-    public static int? PaceSeconds(JsonElement obj, params string[] names)
-    {
-        var raw = Text(obj, names);
-        if (raw is null)
-        {
-            return null;
-        }
-
-        var parts = raw.Split(':', '\'', '"').Where(p => p.Length > 0).ToArray();
-        if (parts.Length >= 2 && int.TryParse(parts[0], CultureInfo.InvariantCulture, out var m) && int.TryParse(parts[1], CultureInfo.InvariantCulture, out var sec))
-        {
-            return m * 60 + sec;
-        }
-
-        return double.TryParse(raw, NumberStyles.Float, CultureInfo.InvariantCulture, out var n) && n is > 120 and < 1200 ? (int)Math.Round(n) : null;
-    }
-
     /// <summary>Structure only (key names), for logs that must not contain health values.</summary>
     public static string Shape(JsonElement e) => e.ValueKind switch
     {
