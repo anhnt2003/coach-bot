@@ -8,7 +8,7 @@ using static CoachBot.Infrastructure.Coros.CorosPayload;
 namespace CoachBot.Infrastructure.Coros;
 
 // Data mapping for the official COROS MCP tools. Argument names/formats come from the live tool schemas; the read
-// tools answer with text, parsed by CorosText (formats verified live with `coros discover`, docs/coros-integration.md).
+// tools answer with text, parsed by CorosText (formats verified live with `coros discover`).
 // The source text is stored with every row.
 public sealed partial class CorosMcpGateway
 {
@@ -150,7 +150,7 @@ public sealed partial class CorosMcpGateway
         var course = BuildCourse(workout, courseSchema, out var unfilled);
         if (unfilled.Count > 0)
         {
-            return new WorkoutPushResult(false, null, $"COROS course requires unmapped fields: {string.Join(", ", unfilled)}. See docs/coros-integration.md.");
+            return new WorkoutPushResult(false, null, $"COROS course requires unmapped fields: {string.Join(", ", unfilled)}.");
         }
 
         var desired = new Dictionary<string, object?> { ["date"] = workout.Date.ToString("yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture), ["course"] = course };

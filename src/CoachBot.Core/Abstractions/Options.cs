@@ -22,8 +22,8 @@ public sealed class CoachOptions
 }
 
 /// <summary>
-/// Deterministic safety limits. Defaults are conservative; see docs/safety.md. The distance-specific values below are
-/// for the marathon; <see cref="ForRace"/> derives the limits for shorter goal races.
+/// Deterministic safety limits. Defaults are conservative. The distance-specific values below are for the marathon;
+/// <see cref="ForRace"/> derives the limits for shorter goal races.
 /// </summary>
 public sealed class SafetyOptions
 {

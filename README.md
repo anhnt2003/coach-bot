@@ -9,9 +9,9 @@ COROS calendar, and talks to you through Telegram (English or Vietnamese).
 
 > **The LLM coaches, the rules check.** The AI coach diagnoses your fitness against the goal, designs the plan and
 > its workouts (intervals, tempos, race-pace blocks, hills, strides — as structured steps), and proposes adjustments
-> after each run. Deterministic safety limits tuned per race distance ([docs/safety.md](docs/safety.md)) cover data
-> integrity and injury ceilings only: a plan week that exceeds them is cut down to them, while coaching heuristics
-> (session mix, 80/20, spacing) are guidelines the AI may go beyond with a reason. Load increases always
+> after each run. Deterministic safety limits tuned per race distance cover data integrity and injury ceilings only: a
+> plan week that exceeds them is cut down to them, while coaching heuristics (session mix, 80/20, spacing) are
+> guidelines the AI may go beyond with a reason. Load increases always
 > wait for your approval, paces always come from measured fitness, and symptom screening combines keywords with LLM
 > triage. Without an LLM, CoachBot runs entirely on the rules. Not medical advice.
 
@@ -85,7 +85,6 @@ chat (on a server it points at `localhost` and does not load — that is expecte
 Pushing approved workouts to the COROS calendar is off by default. Use `coros test-write` to see how a workout
 appears in the COROS app (delete it there afterwards), then set `Coros__EnableWorkoutPush=true`. Workouts are pushed
 for the next `Coach__PushWindowDays` (default 7) days, because the COROS MCP server cannot delete or reschedule them.
-Details and COROS MCP limits: [docs/coros-integration.md](docs/coros-integration.md).
 
 ## Telegram commands
 
@@ -103,8 +102,7 @@ Details and COROS MCP limits: [docs/coros-integration.md](docs/coros-integration
 | `/pause` `/resume` | Pause or resume the plan |
 | `/help` | Command list |
 
-Feedback, symptom reports and free-text messages are screened for red-flag symptoms (English and Vietnamese); see
-[docs/safety.md](docs/safety.md).
+Feedback, symptom reports and free-text messages are screened for red-flag symptoms (English and Vietnamese).
 
 ## Scheduled jobs
 
@@ -141,7 +139,6 @@ src/CoachBot.Infrastructure  EF Core/Supabase, COROS MCP adapter, OAuth, LLM cli
 src/CoachBot.Host            ASP.NET Core host (/health, OAuth callback), CLI verbs (coros …, health)
 supabase/                    Supabase CLI project; migrations/*.sql are the schema source of truth
 tests/                       Core unit tests (incl. the plan-safety grid), infrastructure tests, integration tests
-docs/                        coros-integration.md · safety.md · deployment.md
 ```
 
 ## Tests
@@ -157,5 +154,4 @@ offline; the app itself has no such mode.
 
 ## Deployment
 
-One Docker container plus a hosted Supabase project; Telegram uses long polling, so no public URL is needed. See
-[docs/deployment.md](docs/deployment.md).
+One Docker container plus a hosted Supabase project; Telegram uses long polling, so no public URL is needed.
