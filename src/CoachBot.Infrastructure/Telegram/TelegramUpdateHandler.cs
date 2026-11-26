@@ -121,7 +121,7 @@ public sealed partial class TelegramUpdateHandler(
         {
             case "/start":
             case "/help":
-                await ReplyAsync(fmt.T(lang, "help") + "\n\n" + fmt.T(lang, "disclaimer") + (connected ? "" : "\n\n" + fmt.T(lang, "connect.required")), ct);
+                await ReplyAsync(Html.Blocks(fmt.T(lang, "help"), fmt.T(lang, "disclaimer"), connected ? Html.Empty : fmt.T(lang, "connect.required")), ct);
                 break;
             case "/goal":
                 await GoalAsync(athlete, rest, ct);
@@ -319,9 +319,10 @@ public sealed partial class TelegramUpdateHandler(
         }
 
         var l = athlete.Language;
-        await ReplyAsync(fmt.T(l, "profile.show", athlete.RunDaysPerWeek,
-            MessageFormatter.Culture(l).DateTimeFormat.GetDayName(athlete.LongRunDay),
-            athlete.MaxHr?.ToString(CultureInfo.InvariantCulture) ?? "–", athlete.BirthYear?.ToString(CultureInfo.InvariantCulture) ?? "–", athlete.Language), ct);
+        var notSet = fmt.T(l, "common.not_set");
+        await ReplyAsync(fmt.T(l, "profile.show", athlete.RunDaysPerWeek, fmt.DayName(l, athlete.LongRunDay),
+            athlete.MaxHr is int hr ? hr.ToString(CultureInfo.InvariantCulture) : notSet,
+            athlete.BirthYear is int year ? year.ToString(CultureInfo.InvariantCulture) : notSet, athlete.Language), ct);
     }
 
     private static DayOfWeek? ParseDay(string value) => value.ToLowerInvariant() switch
@@ -391,7 +392,7 @@ public sealed partial class TelegramUpdateHandler(
         await ReplyAsync(fmt.T(lang, "plan.approved"), ct);
         if (orphaned.Count > 0)
         {
-            await ReplyAsync(fmt.T(lang, "plan.orphaned_on_coros") + "\n" + string.Join("\n", orphaned.Select(w => "• " + fmt.Line(lang, w))), ct);
+            await ReplyAsync(Html.Blocks(fmt.T(lang, "plan.orphaned_on_coros"), Html.Lines(orphaned.Select(w => fmt.Line(lang, w)))), ct);
         }
 
         await PushAsync(athlete, ct);

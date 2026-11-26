@@ -76,6 +76,19 @@ public class Activity
     public double? ElevationGainM { get; set; }
     public int? AvgCadence { get; set; }
     public double? TrainingLoad { get; set; }
+    /// <summary>COROS training effect, 0–5.</summary>
+    public double? AerobicTe { get; set; }
+    public double? AnaerobicTe { get; set; }
+    /// <summary>COROS "Training Focus", e.g. "Threshold", "Aerobic Endurance".</summary>
+    public string? TrainingFocus { get; set; }
+    /// <summary>COROS "Performance" of the run, e.g. "Best", "Normal".</summary>
+    public string? Performance { get; set; }
+    public int? BestKmPaceSecPerKm { get; set; }
+    public int? AvgPower { get; set; }
+    /// <summary>The getActivityDetail text the detail fields were read from.</summary>
+    public string? DetailJson { get; set; }
+    /// <summary>When the detail was read; null until then, so a sync fetches it.</summary>
+    public DateTimeOffset? DetailsFetchedAt { get; set; }
     public string? RawJson { get; set; }
     public DateTimeOffset ImportedAt { get; set; }
 
@@ -96,8 +109,15 @@ public class DailyMetric
     public double? AcuteLoad { get; set; }
     public double? ChronicLoad { get; set; }
     public double? LoadRatio { get; set; }
+    /// <summary>COROS training load comment for the day, e.g. "Optimized", "Maintaining".</summary>
+    public string? LoadStatus { get; set; }
     public double? Vo2Max { get; set; }
+    /// <summary>COROS "Running Level" (running ability).</summary>
+    public double? RunningLevel { get; set; }
     public int? ThresholdPaceSecPerKm { get; set; }
+    public int? FiveKPredictionSeconds { get; set; }
+    public int? TenKPredictionSeconds { get; set; }
+    public int? HalfMarathonPredictionSeconds { get; set; }
     public int? MarathonPredictionSeconds { get; set; }
     public string Source { get; set; } = "";
     public string? RawJson { get; set; }

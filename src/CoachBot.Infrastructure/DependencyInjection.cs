@@ -48,6 +48,7 @@ public static class DependencyInjection
         services.AddScoped<SyncService>();
         services.AddScoped<PlanService>();
         services.AddScoped<ReadinessService>();
+        services.AddScoped<WatchService>();
         services.AddScoped<RecommendationService>();
         services.AddScoped<AnalysisService>();
         services.AddScoped<FeedbackService>();

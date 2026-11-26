@@ -312,7 +312,9 @@ public class EndToEndTests(PostgresFixture pg)
             var reports = s.GetRequiredService<ReportService>();
             Assert.NotNull(await reports.DailyCheckAsync(athlete, default));
             Assert.NotNull(await reports.WeeklyReportAsync(athlete, default));
-            Assert.Contains("v1", (await reports.StatusAsync(athlete, default)).Text, StringComparison.Ordinal);
+            var status = (await reports.StatusAsync(athlete, default)).Text;
+            Assert.Contains("<b>Plan</b> · ", status, StringComparison.Ordinal);
+            Assert.DoesNotContain("v1", status, StringComparison.Ordinal);
             Assert.NotEmpty((await reports.TodayAsync(athlete, default)).Text);
             Assert.True(await scope.Db().PlannedWorkouts.AnyAsync(w => w.Status == WorkoutStatus.Missed));
         }

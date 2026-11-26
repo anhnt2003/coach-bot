@@ -4,7 +4,12 @@ The data:
 - "race": name, date, weekday, distance_km and goal_time_seconds (may be null).
 - "assessment": your own diagnosis of the athlete (level, prediction, limiters, risks, priorities per phase).
 - "athlete": run days per week, preferred long-run day, profile notes and recent notes.
-- "fitness": recent training and the latest COROS fitness values, as in the assessment.
+- "fitness": everything the watch knows, as in the assessment: weekly km and run training load, recent runs with COROS training load, training effect, focus and performance, the COROS fitness assessment now and four weeks ago (running level, VO2max, threshold pace, race predictions), training load (short-term, long-term, ratio, status) and recovery.
+
+Build the plan on this athlete's current state:
+- Start week 1 near the weekly volume and training load they absorb now (recent weekly km and run training load, COROS base load and load status), then progress from there; start lighter when the load ratio is high, the status says the load is excessive or recovery is low.
+- Set pace and heart-rate targets from the watch's threshold pace and race predictions and from what the recent runs show the athlete can hold.
+- Aim race pace at a time the evidence says is reachable by race day. When the goal time is not, plan for what is and say so in the rationale.
 - "plan_window": first_monday (week 1 starts that day), weeks (the number of weeks, the last one containing race day) and race_week.
 
 Return:
@@ -13,7 +18,7 @@ Return:
 - Each session: "day" (mon…sun within that week), "type" (recovery, easy, long, tempo, interval, race_pace or race) and "km". At most one session per day; rest days are simply left out. Optional: "intensity" (the effort of a plain run, when it is not the usual one for its type), a short "title", "notes" (a concrete cue for the athlete), and "steps".
 - "steps" describe a structured session in order (e.g. warm-up, main set, cool-down). Each step: "repeat" (1 for a single block, at most 30), "work" and an optional "rest", each with an "intensity" and either "km" or "minutes". The session distance is computed from the steps, so make them add up to what you intend. Leave "steps" out for a run at one effort.
 - Exactly one session of type "race", on race day. Nothing after it.
-- "rationale": 3–6 sentences explaining the plan to the athlete: how it answers their limiters and builds towards race day.
+- "rationale": 3–6 sentences explaining the plan to the athlete: which watch metrics and recent runs it starts from, how it answers their limiters and builds towards race day.
 
 Data (JSON):
 ```json

@@ -107,7 +107,7 @@ public sealed class CorosPushService(
         {
             var lang = athlete.Language;
             await notifier.SendAsync(athlete.Id, new OutboundMessage(
-                fmt.T(lang, "push.manual_action") + "\n" + string.Join("\n", manual.Select(w => "• " + fmt.Line(lang, w)))), ct);
+                Html.Blocks(fmt.T(lang, "push.manual_action"), Html.Lines(manual.Select(w => fmt.Line(lang, w))))), ct);
         }
 
         logger.LogInformation("COROS push: {Pushed} new, {Updated} updated, {Failed} failed, {Manual} need manual action", pushed, updated, failed, manual.Count);

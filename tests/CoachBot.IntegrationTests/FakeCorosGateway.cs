@@ -81,7 +81,10 @@ public sealed class FakeCorosGateway(TimeProvider time, string scenario, string 
                 SleepScore: noHrv ? null : 78 - (fatigued ? 25 : 0),
                 StressAvg: 28 + (fatigued ? 20 : 0),
                 RecoveryPct: fatigued ? 22 : 70 + (int)(Noise(d, 19) * 20),
-                LoadRatio: fatigued ? 1.45 : 1.0 + Math.Round(Noise(d, 23) * 0.15, 2)));
+                AcuteLoad: fatigued ? 130 : 90,
+                ChronicLoad: 88,
+                LoadRatio: fatigued ? 1.45 : 1.0 + Math.Round(Noise(d, 23) * 0.15, 2),
+                LoadStatus: fatigued ? "Excessive" : "Optimized"));
         }
 
         return Task.FromResult<IReadOnlyList<DailyMetricSample>>(result);
@@ -91,7 +94,13 @@ public sealed class FakeCorosGateway(TimeProvider time, string scenario, string 
         Task.FromResult(scenario == "sparse_history"
             ? null
             : new FitnessSnapshot(Vo2Max: 48, ThresholdPaceSecPerKm: 330, MarathonPredictionSeconds: 4 * 3600 + 5 * 60,
-                HalfMarathonPredictionSeconds: 1 * 3600 + 58 * 60, LactateThresholdHr: 168, RawJson: null));
+                HalfMarathonPredictionSeconds: 1 * 3600 + 58 * 60, LactateThresholdHr: 168, RawJson: null,
+                RunningLevel: 68, FiveKPredictionSeconds: 25 * 60 + 40, TenKPredictionSeconds: 53 * 60 + 30));
+
+    /// <summary>Every fake run is an aerobic run with a COROS-like detail.</summary>
+    public Task<ActivityDetail?> GetActivityDetailAsync(Guid athleteId, string externalId, string sportType, CancellationToken ct) =>
+        Task.FromResult<ActivityDetail?>(new ActivityDetail(TrainingLoad: 60, AerobicTe: 3.1, AnaerobicTe: 0.8, TrainingFocus: "Aerobic Endurance",
+            Performance: "Normal", BestKmPaceSecPerKm: 330, AvgPower: 220, AvgCadence: 172, MaxHr: null, ElevationGainM: null, RawJson: null));
 
     public Task<WorkoutPushResult> PushScheduledWorkoutAsync(Guid athleteId, PlannedWorkout workout, CancellationToken ct)
     {

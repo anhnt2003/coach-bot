@@ -247,16 +247,23 @@ public sealed class RecommendationService(
     public OutboundMessage Render(Athlete athlete, Recommendation rec)
     {
         var lang = athlete.Language;
-        var lines = string.Join("\n", Changes(rec).Select(c => "• " + fmt.ChangeLine(lang, c)));
         if (rec.Status == RecommendationStatus.AutoApplied)
         {
-            return new OutboundMessage($"{fmt.T(lang, "rec.auto_applied_header")}\n{lines}",
+            return new OutboundMessage(Html.Blocks(fmt.T(lang, "rec.auto_applied_header"), ChangeItems(lang, rec), fmt.T(lang, "rec.auto_applied_hint")),
                 [[new MessageButton(fmt.T(lang, "button.undo"), $"rec:undo:{rec.Id}")]]);
         }
 
-        return new OutboundMessage($"{fmt.T(lang, "rec.proposed_header")}\n{lines}\n{fmt.T(lang, "rec.expires_hint", coach.Value.ApprovalExpiryHours)}",
+        return new OutboundMessage(
+            Html.Blocks(fmt.T(lang, "rec.proposed_header"), ChangeItems(lang, rec), fmt.T(lang, "rec.expires_hint", coach.Value.ApprovalExpiryHours)),
             [[new MessageButton(fmt.T(lang, "button.approve"), $"rec:approve:{rec.Id}"), new MessageButton(fmt.T(lang, "button.reject"), $"rec:reject:{rec.Id}")]]);
     }
+
+    /// <summary>A proposal that expired unanswered, with the changes that were not made.</summary>
+    public OutboundMessage RenderExpired(string lang, Recommendation rec) =>
+        new(Html.Blocks(fmt.T(lang, "rec.expired_notice"), ChangeItems(lang, rec)));
+
+    /// <summary>One item per changed session.</summary>
+    private Html ChangeItems(string lang, Recommendation rec) => Html.Blocks(Changes(rec).Select(c => fmt.ChangeItem(lang, c)));
 
     /// <summary>The stored changes; rows from before changes carried full workout states have none and cannot be applied.</summary>
     private static List<WorkoutChange> Changes(Recommendation rec) =>

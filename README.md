@@ -102,6 +102,12 @@ dotnet run --project src/CoachBot.Host -- coros test-write 2026-11-05  # creates
 or from Telegram: `/connect`, open the link, approve, and paste the address you were redirected to back into the
 chat (on a server it points at `localhost` and does not load — that is expected).
 
+Each sync reads the runs and, for each run, COROS's detail of it (training load, aerobic and anaerobic training
+effect, training focus, performance); the daily health data (resting HR, sleep HRV, sleep, stress, recovery); the
+training load (short-term, long-term, ratio and COROS's status); and the fitness assessment (VO2max, running level,
+threshold pace, 5K/10K/half/marathon predictions). The coach diagnoses and plans from all of it, and the plan proposal
+and `/status` show the watch metrics it used. COROS's own recommended weekly load is not offered by its MCP server.
+
 Pushing approved workouts to the COROS calendar is off by default. Use `coros test-write` to see how a workout
 appears in the COROS app (delete it there afterwards), then set `Coros__EnableWorkoutPush=true`. Workouts are pushed
 for the next `Coach__PushWindowDays` (default 7) days, because the COROS MCP server cannot delete or reschedule them.

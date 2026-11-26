@@ -124,12 +124,20 @@ public sealed class PostgresCollection : ICollectionFixture<PostgresFixture>
     public const string Name = "postgres";
 }
 
+/// <summary>Records messages, and fails a test whose message Telegram would reject or show with stray markup.</summary>
 public sealed class CapturingNotifier : INotifier
 {
     public List<OutboundMessage> Messages { get; } = [];
 
     public Task<long?> SendAsync(Guid athleteId, OutboundMessage message, CancellationToken ct)
     {
+        var problems = CoachBot.Infrastructure.Telegram.TelegramHtml.Problems(message.Text).ToList();
+        if (message.Text.Contains("&amp;lt;", StringComparison.Ordinal) || message.Text.Contains("&lt;b&gt;", StringComparison.Ordinal))
+        {
+            problems.Add("escaped twice");
+        }
+
+        Assert.True(problems.Count == 0, $"Invalid Telegram HTML ({string.Join("; ", problems)}):\n{message.Text}");
         Messages.Add(message);
         return Task.FromResult<long?>(Messages.Count);
     }

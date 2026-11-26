@@ -126,14 +126,14 @@ public class LocalizationTests
 
         Assert.Equal("2 km easy → 5 × (1 km 5K pace 4:38–4:50/km, 90 s jog) → 6 × 20 s strides (fast, relaxed)", fmt.Steps("en", blocks));
         Assert.Equal("2 km nhẹ → 5 × (1 km pace 5K 4:38–4:50/km, 90 s chạy hồi phục) → 6 × 20 s strides (tăng tốc ngắn, thả lỏng)", fmt.Steps("vi", blocks));
-        Assert.Equal("Bán marathon (21,1 km)", fmt.RaceDistance("vi", 21.0975));
+        Assert.Equal("Bán marathon", fmt.RaceDistance("vi", 21.0975));
         Assert.Equal("15 km", fmt.RaceDistance("en", 15));
     }
 
     [Fact]
     public void Formats_arguments_invariantly()
     {
-        Assert.Equal("🎯 Goal saved: X (Half marathon) on Sun 14/03, 20 weeks away · target time 1:45:00. Next: /sync full to load your history, then /plan.",
+        Assert.Equal("🎯 <b>Goal saved: X</b>\nHalf marathon · Sun 14/03 · 20 weeks away · target 1:45:00\n\nNext: /sync full to load your history, then /plan.",
             Catalog.Get("en", "goal.saved", "X", "Half marathon", "Sun 14/03", 20, "1:45:00"));
     }
 }

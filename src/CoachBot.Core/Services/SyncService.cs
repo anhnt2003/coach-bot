@@ -52,6 +52,9 @@ public sealed class SyncService(
                 await UpsertMetricAsync(athlete.Id, sample, ct);
             }
 
+            await db.SaveChangesAsync(ct);
+            await FetchRunDetailsAsync(athlete.Id, ct);
+
             if (fitness is not null)
             {
                 await UpsertMetricAsync(athlete.Id, new DailyMetricSample(today, RawJson: null), ct, fitness);
@@ -108,10 +111,14 @@ public sealed class SyncService(
         a.DistanceMeters = s.DistanceMeters;
         a.AvgPaceSecPerKm = s.AvgPaceSecPerKm ?? (s.DistanceMeters > 0 ? (int)Math.Round(s.DurationSeconds / (s.DistanceMeters / 1000.0)) : null);
         a.AvgHr = s.AvgHr;
-        a.MaxHr = s.MaxHr;
-        a.ElevationGainM = s.ElevationGainM;
-        a.AvgCadence = s.AvgCadence;
-        a.TrainingLoad = s.TrainingLoad;
+        // The run's detail is the better source of these: once it was read, a re-listed activity keeps its values.
+        if (a.DetailsFetchedAt is null)
+        {
+            a.MaxHr = s.MaxHr ?? a.MaxHr;
+            a.ElevationGainM = s.ElevationGainM ?? a.ElevationGainM;
+            a.AvgCadence = s.AvgCadence ?? a.AvgCadence;
+            a.TrainingLoad = s.TrainingLoad ?? a.TrainingLoad;
+        }
         a.RawJson = s.RawJson;
 
         if (isNew)
@@ -147,15 +154,70 @@ public sealed class SyncService(
         m.AcuteLoad = s.AcuteLoad ?? m.AcuteLoad;
         m.ChronicLoad = s.ChronicLoad ?? m.ChronicLoad;
         m.LoadRatio = s.LoadRatio ?? m.LoadRatio;
+        m.LoadStatus = s.LoadStatus ?? m.LoadStatus;
         m.RawJson = s.RawJson ?? m.RawJson;
         if (fitness is not null)
         {
             m.Vo2Max = fitness.Vo2Max ?? m.Vo2Max;
             m.ThresholdPaceSecPerKm = fitness.ThresholdPaceSecPerKm ?? m.ThresholdPaceSecPerKm;
             m.MarathonPredictionSeconds = fitness.MarathonPredictionSeconds ?? m.MarathonPredictionSeconds;
+            m.HalfMarathonPredictionSeconds = fitness.HalfMarathonPredictionSeconds ?? m.HalfMarathonPredictionSeconds;
+            m.TenKPredictionSeconds = fitness.TenKPredictionSeconds ?? m.TenKPredictionSeconds;
+            m.FiveKPredictionSeconds = fitness.FiveKPredictionSeconds ?? m.FiveKPredictionSeconds;
+            m.RunningLevel = fitness.RunningLevel ?? m.RunningLevel;
         }
 
         m.UpdatedAt = time.GetUtcNow();
+    }
+
+    /// <summary>Most run details read per sync (enough for 8 weeks of daily runs); any rest follow at the next syncs.</summary>
+    public const int DetailsPerSync = 60;
+
+    /// <summary>
+    /// Reads the detail of recent runs that have none yet (training load, training effect, focus, performance), newest
+    /// first. A run whose detail cannot be read is retried at the next sync; a failure here never fails the sync.
+    /// </summary>
+    private async Task FetchRunDetailsAsync(Guid athleteId, CancellationToken ct)
+    {
+        // A day more than the full import, which counts calendar days back from the athlete's today.
+        var since = time.GetUtcNow().AddDays(-(FullActivityDays + 1));
+        var runs = await db.Activities
+            .Where(a => a.AthleteId == athleteId && a.Source == gateway.Source && a.DetailsFetchedAt == null && a.StartTime >= since
+                        && Activity.RunSportTypes.Contains(a.SportType))
+            .OrderByDescending(a => a.StartTime)
+            .Take(DetailsPerSync)
+            .ToListAsync(ct);
+        foreach (var run in runs)
+        {
+            ActivityDetail? detail;
+            try
+            {
+                detail = await gateway.GetActivityDetailAsync(athleteId, run.ExternalId, run.SportType, ct);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException && ex is not CorosAuthException)
+            {
+                logger.LogWarning(ex, "Detail of activity {ActivityId} could not be read; retried at the next sync", run.Id);
+                continue;
+            }
+
+            if (detail is null)
+            {
+                continue;
+            }
+
+            run.TrainingLoad = detail.TrainingLoad ?? run.TrainingLoad;
+            run.AerobicTe = detail.AerobicTe;
+            run.AnaerobicTe = detail.AnaerobicTe;
+            run.TrainingFocus = detail.TrainingFocus;
+            run.Performance = detail.Performance;
+            run.BestKmPaceSecPerKm = detail.BestKmPaceSecPerKm;
+            run.AvgPower = detail.AvgPower;
+            run.AvgCadence = detail.AvgCadence ?? run.AvgCadence;
+            run.MaxHr = detail.MaxHr ?? run.MaxHr;
+            run.ElevationGainM = detail.ElevationGainM ?? run.ElevationGainM;
+            run.DetailJson = detail.RawJson;
+            run.DetailsFetchedAt = time.GetUtcNow();
+        }
     }
 
     private static string Truncate(string value, int max) => value.Length <= max ? value : value[..max];

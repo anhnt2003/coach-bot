@@ -71,11 +71,11 @@ public sealed class CronJobService(
             sp.GetRequiredService<CorosPushService>().PushUpcomingAsync(athlete, ct)),
         new("expire_recommendations", CronExpression.Parse(options.Value.ExpiryCron), async (sp, athlete, ct) =>
         {
-            var fmt = sp.GetRequiredService<MessageFormatter>();
+            var recommendations = sp.GetRequiredService<RecommendationService>();
             var notifier = sp.GetRequiredService<INotifier>();
-            foreach (var rec in await sp.GetRequiredService<RecommendationService>().ExpireDueAsync(ct))
+            foreach (var rec in await recommendations.ExpireDueAsync(ct))
             {
-                await notifier.SendAsync(rec.AthleteId, new OutboundMessage(fmt.T(athlete.Language, "rec.expired_notice", rec.Summary)), ct);
+                await notifier.SendAsync(rec.AthleteId, recommendations.RenderExpired(athlete.Language, rec), ct);
             }
         }),
     ];

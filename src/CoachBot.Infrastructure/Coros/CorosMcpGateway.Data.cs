@@ -115,7 +115,11 @@ public sealed partial class CorosMcpGateway
         {
             foreach (var (date, l) in CorosText.TrainingLoad(load))
             {
-                Merge(date, s => s with { AcuteLoad = l.ShortTerm ?? s.AcuteLoad, ChronicLoad = l.LongTerm ?? s.ChronicLoad, LoadRatio = l.Ratio ?? s.LoadRatio });
+                Merge(date, s => s with
+                {
+                    AcuteLoad = l.ShortTerm ?? s.AcuteLoad, ChronicLoad = l.LongTerm ?? s.ChronicLoad, LoadRatio = l.Ratio ?? s.LoadRatio,
+                    LoadStatus = l.Status ?? s.LoadStatus,
+                });
             }
         }
 
@@ -130,6 +134,22 @@ public sealed partial class CorosMcpGateway
 
     public async Task<FitnessSnapshot?> GetFitnessAsync(Guid athleteId, CancellationToken ct) =>
         await CallTextAsync(athleteId, "queryFitnessAssessmentOverview", new(), required: false, ct) is { } text ? CorosText.Fitness(text) : null;
+
+    public async Task<ActivityDetail?> GetActivityDetailAsync(Guid athleteId, string externalId, string sportType, CancellationToken ct) =>
+        SportCode(sportType) is int code
+        && await CallTextAsync(athleteId, "getActivityDetail", new() { ["labelId"] = externalId, ["sportType"] = code }, required: false, ct) is { } text
+            ? CorosText.ActivityDetail(text)
+            : null;
+
+    /// <summary>The COROS sport code of a run stored under <see cref="SportName"/>; other sports have no detail read.</summary>
+    internal static int? SportCode(string sportType) => sportType switch
+    {
+        "run" => 100,
+        "treadmill" => 101,
+        "trail_run" => 102,
+        "track" => 103,
+        _ => null,
+    };
 
     /// <summary>
     /// Creates (or updates) a standalone workout on the COROS calendar. The `course` object is built from the live

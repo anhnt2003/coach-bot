@@ -85,7 +85,43 @@ public class LlmIntegrationTests(PostgresFixture pg)
         Assert.Null(context["guidelines"]);
         Assert.Null(context["baseline_plan"]);
 
+        // ...with everything the watch knows: fitness assessment, training load, and COROS's reading of each run.
+        var fitness = context["fitness"]!;
+        Assert.Equal(68, fitness["watch"]!["running_level"]!.GetValue<double>());
+        Assert.Equal("25:40", fitness["watch"]!["five_k_prediction"]!.GetValue<string>());
+        Assert.Equal(4 * 3600 + 5 * 60, fitness["watch"]!["goal_distance_prediction_seconds"]!.GetValue<int>());
+        Assert.Equal("Optimized", fitness["training_load"]!["status"]!.GetValue<string>());
+        Assert.Equal(88, fitness["training_load"]!["long_term_load"]!.GetValue<double>());
+        Assert.NotEmpty(fitness["training_load"]!["last_two_weeks"]!.AsArray());
+        var lastRun = fitness["recent_runs"]![0]!;
+        Assert.Equal(("Aerobic Endurance", "Normal", 60.0), (lastRun["training_focus"]!.GetValue<string>(), lastRun["performance"]!.GetValue<string>(),
+            lastRun["training_load"]!.GetValue<double>()));
+        Assert.Contains(fitness["weekly_run_training_load_oldest_first"]!.AsArray(), w => w is not null && w.GetValue<double>() > 0);
+        Assert.Equal(context["fitness"]!.ToJsonString(), ScriptedLlm.Context(llm.Requests.Single(r => r.Purpose == "athlete_assessment"))["fitness"]!.ToJsonString());
+
+        // The proposal shows the watch metrics the plan was built from.
+        var proposal = t.S.GetRequiredService<PlanService>().RenderProposal(t.Athlete, plan, (await t.S.GetRequiredService<AthleteService>().GetActiveGoalAsync(t.Athlete.Id, default))!);
+        Assert.Contains("Running level 68", proposal.Text, StringComparison.Ordinal);
+        Assert.Contains("Predicted marathon: <b>4:05:00</b>", proposal.Text, StringComparison.Ordinal);
+
         Assert.Equal(new[] { "ok", "ok" }, await t.Scope.Db().LlmCalls.OrderBy(c => c.CreatedAt).Select(c => c.Status).ToListAsync());
+    }
+
+    [Fact]
+    public async Task Sync_reads_run_details_once_and_a_later_sync_keeps_them()
+    {
+        await using var t = await SetupAsync(new ScriptedLlm());
+        var db = t.Scope.Db();
+        Assert.All(await db.Activities.Where(a => Activity.RunSportTypes.Contains(a.SportType)).ToListAsync(), a =>
+            Assert.Equal((60.0, "Aerobic Endurance", true), (a.TrainingLoad!.Value, a.TrainingFocus, a.DetailsFetchedAt is not null)));
+
+        await t.S.GetRequiredService<SyncService>().SyncAsync(t.Athlete, 3, 7, default);
+
+        // The activity list has no training load; it must not erase the one read from the detail.
+        var runs = await db.Activities.AsNoTracking().Where(a => Activity.RunSportTypes.Contains(a.SportType)).ToListAsync();
+        Assert.All(runs, a => Assert.Equal(60.0, a.TrainingLoad));
+        var today = await db.DailyMetrics.AsNoTracking().OrderByDescending(m => m.Date).FirstAsync();
+        Assert.Equal((68.0, 25 * 60 + 40, "Optimized"), (today.RunningLevel!.Value, today.FiveKPredictionSeconds!.Value, today.LoadStatus));
     }
 
     /// <summary>Gives every quality session a structure: warm-up, 2 repeats, cool-down.</summary>
@@ -145,7 +181,7 @@ public class LlmIntegrationTests(PostgresFixture pg)
         Assert.Equal("threshold", design["assessment"]!["limiters"]![0]!["area"]!.GetValue<string>());
         var message = plans.RenderProposal(t.Athlete, plan, (await t.S.GetRequiredService<AthleteService>().GetActiveGoalAsync(t.Athlete.Id, default))!);
         Assert.Contains("🩺", message.Text, StringComparison.Ordinal);
-        Assert.Contains("threshold (lactate) pace (no runs faster than easy pace in 8 weeks)", message.Text, StringComparison.Ordinal);
+        Assert.Contains("<b>Threshold (lactate) pace</b>: no runs faster than easy pace in 8 weeks", message.Text, StringComparison.Ordinal);
         Assert.Contains("Half marathon", message.Text, StringComparison.Ordinal);
         Assert.Contains("4:05:00", message.Text, StringComparison.Ordinal);
     }
@@ -328,7 +364,10 @@ public class LlmIntegrationTests(PostgresFixture pg)
         var check = await t.Scope.Db().ReadinessChecks.SingleAsync();
         Assert.Equal((ReadinessLevel.Red, "daily_check"), (check.Level, check.Source));
         Assert.Equal(WorkoutType.Rest, plan.Workouts.Single(w => w.Date == new DateOnly(2026, 10, 27)).Type);
-        Assert.Contains("checked", (await reports.TodayAsync(t.Athlete, default)).Text, StringComparison.Ordinal);
+        // /today shows this morning's verdict, without a "checked on" date since it is today's.
+        var today = (await reports.TodayAsync(t.Athlete, default)).Text;
+        Assert.Contains("🔴", today, StringComparison.Ordinal);
+        Assert.DoesNotContain("checked", today, StringComparison.Ordinal);
     }
 
     private static ScriptedLlm Triage(string answer) => new((r, ctx) => r.Purpose == "symptom_triage" ? answer : ScriptedLlm.Default(r, ctx));

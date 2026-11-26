@@ -108,7 +108,13 @@ public sealed class AnalysisService(
                 pace = MessageFormatter.Pace(activity.AvgPaceSecPerKm),
                 avg_hr = activity.AvgHr,
                 max_hr = activity.MaxHr,
+                best_km_pace = activity.BestKmPaceSecPerKm is int best ? MessageFormatter.Pace(best) : null,
+                elevation_gain_m = activity.ElevationGainM,
                 training_load = activity.TrainingLoad,
+                aerobic_te = activity.AerobicTe,
+                anaerobic_te = activity.AnaerobicTe,
+                training_focus = activity.TrainingFocus,
+                performance = activity.Performance,
                 activity.Name,
             },
             goal = LlmContext.Goal(goal),
@@ -227,40 +233,30 @@ public sealed class AnalysisService(
         IReadOnlyList<string> concerns, RunAnalysis analysis, IReadOnlyList<Recommendation> recs, IReadOnlyList<string> symptomConcerns)
     {
         var lang = athlete.Language;
-        var sb = new StringBuilder();
-        sb.AppendLine(fmt.T(lang, "analysis.header", MessageFormatter.Km(Math.Round(activity.DistanceKm, 1)),
-            MessageFormatter.Pace(activity.AvgPaceSecPerKm), activity.AvgHr?.ToString(System.Globalization.CultureInfo.InvariantCulture) ?? "–"));
-        sb.AppendLine(matched is null ? fmt.T(lang, "analysis.unplanned") : fmt.T(lang, "analysis.planned", fmt.Line(lang, matched)));
-
-        sb.AppendLine();
-        sb.AppendLine(fmt.ReadinessLine(lang, level, confidence));
-        sb.AppendLine(readinessSummary);
-        foreach (var concern in concerns)
+        var blocks = new List<Html>
         {
-            sb.AppendLine("• " + concern);
-        }
-
-        if (!string.IsNullOrWhiteSpace(analysis.Narrative))
-        {
-            sb.AppendLine().AppendLine(analysis.Narrative);
-        }
-
-        if (symptomConcerns.Count > 0)
-        {
-            sb.AppendLine().AppendLine(fmt.T(lang, "analysis.llm_concern"));
-        }
+            Html.Lines(
+                fmt.T(lang, "analysis.title", fmt.Day(lang, AthleteClock.LocalDate(activity.StartTime, athlete.TimeZone))),
+                fmt.T(lang, "analysis.stats", MessageFormatter.Km(Math.Round(activity.DistanceKm, 1)), MessageFormatter.Pace(activity.AvgPaceSecPerKm),
+                    activity.AvgHr?.ToString(System.Globalization.CultureInfo.InvariantCulture) ?? "–"),
+                matched is null ? fmt.T(lang, "analysis.unplanned") : fmt.T(lang, "analysis.planned", fmt.Summary(lang, PlanAdjuster.State(matched)))),
+            fmt.ReadinessBlock(lang, level, confidence, readinessSummary, concerns),
+            string.IsNullOrWhiteSpace(analysis.Narrative)
+                ? Html.Empty
+                : Html.Expandable(Html.Lines(fmt.T(lang, "common.notes_title"), Html.Text(analysis.Narrative))),
+            symptomConcerns.Count > 0 ? fmt.T(lang, "analysis.llm_concern") : Html.Empty,
+        };
 
         var buttons = new List<IReadOnlyList<MessageButton>>();
         foreach (var rec in recs)
         {
             var recMessage = recommendations.Render(athlete, rec);
-            sb.AppendLine().AppendLine(rec.Summary).AppendLine(recMessage.Text);
+            blocks.Add(new Html(recMessage.Text));
             buttons.AddRange(recMessage.Buttons ?? []);
         }
 
-        sb.AppendLine().AppendLine(fmt.T(lang, "analysis.ask_rpe"));
-        buttons.Add([.. Enumerable.Range(1, 5).Select(i => new MessageButton(i.ToString(System.Globalization.CultureInfo.InvariantCulture), $"rpe:{activity.Id}:{i}"))]);
-        buttons.Add([.. Enumerable.Range(6, 5).Select(i => new MessageButton(i.ToString(System.Globalization.CultureInfo.InvariantCulture), $"rpe:{activity.Id}:{i}"))]);
-        return new OutboundMessage(sb.ToString().TrimEnd(), buttons);
+        blocks.Add(fmt.T(lang, "analysis.ask_rpe"));
+        buttons.AddRange(ReportService.RpeButtons(activity.Id));
+        return new OutboundMessage(Html.Blocks(blocks), buttons);
     }
 }

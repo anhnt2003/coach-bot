@@ -45,7 +45,8 @@ public sealed record PlanSnapshot(
     int WeeksOfHistory,
     double? Vo2Max,
     IReadOnlyList<WeeklyFocus>? WeeklyFocus = null,
-    AthleteAssessment? Assessment = null)
+    AthleteAssessment? Assessment = null,
+    WatchMetrics? Watch = null)
 {
     public static PlanSnapshot? Of(TrainingPlan plan) => CoachJson.Deserialize<PlanSnapshot>(plan.InputsJson);
 

@@ -13,6 +13,7 @@ public sealed class PlanService(
     ICoachDb db,
     AthleteService athletes,
     ICorosGateway gateway,
+    WatchService watch,
     CoachLlm llm,
     MessageFormatter fmt,
     TimeProvider time,
@@ -22,6 +23,13 @@ public sealed class PlanService(
         db.TrainingPlans
             .Include(p => p.Workouts)
             .Where(p => p.AthleteId == athleteId && (p.Status == PlanStatus.Active || p.Status == PlanStatus.Paused))
+            .OrderByDescending(p => p.Version)
+            .FirstOrDefaultAsync(ct);
+
+    /// <summary>The latest proposal still waiting for the athlete's approval, without its workouts.</summary>
+    public Task<TrainingPlan?> GetPendingPlanAsync(Guid athleteId, CancellationToken ct) =>
+        db.TrainingPlans
+            .Where(p => p.AthleteId == athleteId && p.Status == PlanStatus.PendingApproval)
             .OrderByDescending(p => p.Version)
             .FirstOrDefaultAsync(ct);
 
@@ -47,7 +55,7 @@ public sealed class PlanService(
         }
 
         var lang = athlete.Language;
-        var history = await LoadHistoryAsync(athlete, today, ct);
+        var history = await LoadHistoryAsync(athlete, today, goal.DistanceKm, ct);
         var notesSince = time.GetUtcNow().AddDays(-30);
         var notes = await db.Feedback.Where(f => f.AthleteId == athlete.Id && f.Notes != null && f.CreatedAt >= notesSince)
             .OrderByDescending(f => f.CreatedAt).Select(f => f.Notes!).Take(10).ToListAsync(ct);
@@ -96,7 +104,7 @@ public sealed class PlanService(
 
         var focus = (design.Weeks ?? []).Where(w => !string.IsNullOrWhiteSpace(w.Focus)).Select(w => new WeeklyFocus(w.Week, w.Focus!)).ToList();
         var snapshot = new PlanSnapshot(mapped.Paces, goal.DistanceKm, history.WeeklyKmLast4WeeksAvg, history.LongestRunLast4WeeksKm,
-            history.WeeksOfHistory, history.Vo2Max, focus, assessment);
+            history.WeeksOfHistory, history.Current?.Vo2Max, focus, assessment, history.Current);
 
         var previous = await db.TrainingPlans.Where(p => p.AthleteId == athlete.Id).MaxAsync(p => (int?)p.Version, ct) ?? 0;
         foreach (var pending in await db.TrainingPlans.Where(p => p.AthleteId == athlete.Id && p.Status == PlanStatus.PendingApproval).ToListAsync(ct))
@@ -190,79 +198,69 @@ public sealed class PlanService(
     public OutboundMessage RenderProposal(Athlete athlete, TrainingPlan plan, RaceGoal goal)
     {
         var lang = athlete.Language;
-        var sb = new StringBuilder();
         var weeks = plan.Workouts.GroupBy(w => w.WeekIndex).OrderBy(g => g.Key).ToList();
         var peak = weeks.Max(g => g.Where(w => w.Type != WorkoutType.Race).Sum(w => w.TargetDistanceKm));
         var longest = plan.Workouts.Where(w => w.Type == WorkoutType.Long).Select(w => w.TargetDistanceKm).DefaultIfEmpty(0).Max();
-        var snapshot = PlanSnapshot.Of(plan);
-
         var taperWeeks = weeks.Count(g => g.Any(w => w.Phase == PlanPhase.Taper));
-        sb.AppendLine(fmt.T(lang, "plan.proposal_header", goal.Name, fmt.RaceDistance(lang, goal.DistanceKm), fmt.Day(lang, goal.RaceDate), weeks.Count));
-        sb.AppendLine(fmt.T(lang, "plan.proposal_stats", MessageFormatter.Km(weeks[0].Where(w => w.Type != WorkoutType.Race).Sum(w => w.TargetDistanceKm)),
-            MessageFormatter.Km(peak), MessageFormatter.Km(longest), taperWeeks));
-        sb.AppendLine(fmt.T(lang, "plan.designed_by_llm"));
-        if (snapshot?.Assessment is { } a)
-        {
-            if (a.PredictedRaceSeconds is int predicted and > 0)
-            {
-                sb.AppendLine(goal.GoalTimeSeconds is int goalSeconds
-                    ? fmt.T(lang, "plan.prediction_goal", MessageFormatter.Time(predicted), MessageFormatter.Time(goalSeconds))
-                    : fmt.T(lang, "plan.prediction", MessageFormatter.Time(predicted)));
-            }
+        var firstWeek = weeks[0].OrderBy(w => w.Date).ToList();
+        var snapshot = PlanSnapshot.Of(plan);
+        var assessment = snapshot?.Assessment;
 
-            sb.AppendLine().Append(RenderAssessment(lang, a));
-        }
+        var prediction = assessment?.PredictedRaceSeconds is int predicted and > 0
+            ? goal.GoalTimeSeconds is int goalSeconds
+                ? fmt.T(lang, "plan.goal_prediction", MessageFormatter.Time(goalSeconds), MessageFormatter.Time(predicted))
+                : fmt.T(lang, "plan.prediction", MessageFormatter.Time(predicted))
+            : Html.Empty;
+        var verdict = assessment?.GoalVerdict is "realistic" or "ambitious" or "unrealistic" && goal.GoalTimeSeconds is not null
+            ? fmt.T(lang, $"plan.verdict.{assessment.GoalVerdict}")
+            : Html.Empty;
+        var warnings = (CoachJson.Deserialize<List<string>>(plan.WarningsJson) ?? []).Select(w => new Html("⚠️ " + fmt.T(lang, w).Value));
 
-        foreach (var warning in CoachJson.Deserialize<List<string>>(plan.WarningsJson) ?? [])
-        {
-            sb.AppendLine("⚠️ " + fmt.T(lang, warning));
-        }
-
-        if (!string.IsNullOrWhiteSpace(plan.Rationale))
-        {
-            sb.AppendLine().AppendLine(plan.Rationale);
-        }
-
-        sb.AppendLine().AppendLine(fmt.T(lang, "plan.first_week"));
-        foreach (var w in weeks[0].OrderBy(w => w.Date))
-        {
-            sb.AppendLine("• " + fmt.Line(lang, w));
-        }
-
-        sb.AppendLine().AppendLine(fmt.T(lang, "disclaimer"));
-        return new OutboundMessage(sb.ToString().TrimEnd(),
+        var text = Html.Blocks(
+            Html.Lines(
+                fmt.T(lang, "plan.proposal_title", goal.Name),
+                fmt.T(lang, "plan.proposal_subtitle", fmt.RaceDistance(lang, goal.DistanceKm), fmt.Day(lang, goal.RaceDate), weeks.Count)),
+            Html.Lines(
+            [
+                prediction,
+                verdict,
+                fmt.T(lang, "plan.volume", MessageFormatter.Km(weeks[0].Where(w => w.Type != WorkoutType.Race).Sum(w => w.TargetDistanceKm)),
+                    MessageFormatter.Km(peak), MessageFormatter.Km(longest), taperWeeks),
+                .. warnings,
+            ]),
+            snapshot?.Watch is { } watched ? fmt.Watch(lang, watched, goal.DistanceKm) : Html.Empty,
+            Html.Lines(
+                fmt.T(lang, "plan.week_heading", MessageFormatter.Dates(firstWeek[0].Date, firstWeek[^1].Date)),
+                Html.Lines(firstWeek.Select(w => fmt.Line(lang, w)))),
+            assessment is null ? Html.Empty : Html.Expandable(RenderAssessment(lang, assessment)),
+            string.IsNullOrWhiteSpace(plan.Rationale)
+                ? Html.Empty
+                : Html.Expandable(Html.Lines(fmt.T(lang, "plan.rationale_title"), Html.Text(plan.Rationale.Trim()))),
+            fmt.T(lang, "disclaimer.short"));
+        return new OutboundMessage(text,
         [
             [new MessageButton(fmt.T(lang, "button.approve_plan"), $"plan:approve:{plan.Id}"), new MessageButton(fmt.T(lang, "button.reject"), $"plan:reject:{plan.Id}")],
         ]);
     }
 
-    /// <summary>The LLM's diagnosis in a few lines; unknown enum values from the LLM are shown as given.</summary>
-    public string RenderAssessment(string lang, AthleteAssessment a)
+    /// <summary>The LLM's diagnosis: level and summary, goal verdict, then strengths, limiters and risks as lists.</summary>
+    public Html RenderAssessment(string lang, AthleteAssessment a)
     {
-        var sb = new StringBuilder();
-        sb.AppendLine(fmt.T(lang, "assess.header", Label(lang, "assess.level.", a.Level)) + (string.IsNullOrWhiteSpace(a.Summary) ? "" : " " + a.Summary));
-        if (!string.IsNullOrWhiteSpace(a.GoalVerdict) && a.GoalVerdict != "no_goal_time")
-        {
-            sb.AppendLine(fmt.T(lang, "assess.goal", Label(lang, "assess.verdict.", a.GoalVerdict)) + (string.IsNullOrWhiteSpace(a.GoalComment) ? "" : " " + a.GoalComment));
-        }
-
-        if (a.Strengths is { Count: > 0 })
-        {
-            sb.AppendLine(fmt.T(lang, "assess.strengths", string.Join("; ", a.Strengths)));
-        }
-
-        if (a.Limiters is { Count: > 0 })
-        {
-            sb.AppendLine(fmt.T(lang, "assess.limiters", string.Join("; ", a.Limiters.Select(l =>
-                string.IsNullOrWhiteSpace(l.Evidence) ? Label(lang, "assess.limiter.", l.Area) : $"{Label(lang, "assess.limiter.", l.Area)} ({l.Evidence})"))));
-        }
-
-        if (a.Risks is { Count: > 0 })
-        {
-            sb.AppendLine(fmt.T(lang, "assess.risks", string.Join("; ", a.Risks)));
-        }
-
-        return sb.ToString();
+        var goal = !string.IsNullOrWhiteSpace(a.GoalVerdict) && a.GoalVerdict != "no_goal_time"
+            ? Html.Lines(fmt.T(lang, "assess.goal", Label(lang, "assess.verdict.", a.GoalVerdict)),
+                string.IsNullOrWhiteSpace(a.GoalComment) ? Html.Empty : Html.Text(a.GoalComment.Trim()))
+            : Html.Empty;
+        return Html.Blocks(
+            Html.Lines(fmt.T(lang, "plan.assessment_title", Label(lang, "assess.level.", a.Level)),
+                string.IsNullOrWhiteSpace(a.Summary) ? Html.Empty : Html.Text(a.Summary.Trim())),
+            goal,
+            a.Strengths is { Count: > 0 } ? Html.Lines(fmt.T(lang, "assess.strengths"), Html.Bullets(a.Strengths)) : Html.Empty,
+            a.Limiters is { Count: > 0 }
+                ? Html.Lines([fmt.T(lang, "assess.limiters"), .. a.Limiters.Select(l => string.IsNullOrWhiteSpace(l.Evidence)
+                    ? new Html("• " + Html.Bold(Label(lang, "assess.limiter.", l.Area)).Value)
+                    : fmt.T(lang, "assess.limiter_item", Label(lang, "assess.limiter.", l.Area), l.Evidence.Trim()))])
+                : Html.Empty,
+            a.Risks is { Count: > 0 } ? Html.Lines(fmt.T(lang, "assess.risks"), Html.Bullets(a.Risks)) : Html.Empty);
     }
 
     private static readonly HashSet<string> AssessmentLabels =
@@ -276,50 +274,101 @@ public sealed class PlanService(
     private string Label(string lang, string prefix, string? value)
     {
         var key = prefix + value;
-        return AssessmentLabels.Contains(key) ? fmt.T(lang, key) : value ?? "";
+        return AssessmentLabels.Contains(key) ? fmt.Text(lang, key) : value ?? "";
     }
 
     /// <summary>Training history as the LLM sees it: raw numbers, summed and counted but never judged.</summary>
+    /// <summary>
+    /// Everything the plan is built from, as the LLM sees it: raw numbers, summed and counted but never judged. Weekly
+    /// values cover the last 8 full weeks before today, oldest first.
+    /// </summary>
     private sealed record History(
         IReadOnlyList<double> WeeklyKmOldestFirst,
+        IReadOnlyList<double?> WeeklyRunTrainingLoadOldestFirst,
         double WeeklyKmLast4WeeksAvg,
         double LongestRunLast4WeeksKm,
         int WeeksOfHistory,
         IReadOnlyList<RecentRun> RecentRuns,
-        DateOnly? CorosFitnessDate,
-        int? CorosThresholdPaceSecPerKm,
-        int? CorosMarathonPredictionSeconds,
-        double? Vo2Max);
+        WatchFitness? Watch,
+        WatchFitness? WatchFourWeeksAgo,
+        TrainingLoadState? TrainingLoad,
+        RecoveryState? Recovery,
+        [property: System.Text.Json.Serialization.JsonIgnore] WatchMetrics? Current);
 
-    /// <summary>A recent run as shown to the LLM.</summary>
-    private sealed record RecentRun(DateOnly Date, double Km, int DurationMinutes, string? Pace, int? AvgHr, string? Name);
+    /// <summary>A recent run as shown to the LLM, with COROS's own reading of it.</summary>
+    private sealed record RecentRun(
+        DateOnly Date, double Km, int DurationMinutes, string? Pace, string? BestKmPace, int? AvgHr, int? MaxHr, double? ElevationGainM,
+        double? TrainingLoad, double? AerobicTe, double? AnaerobicTe, string? TrainingFocus, string? Performance, string? Name);
 
-    private async Task<History> LoadHistoryAsync(Athlete athlete, DateOnly today, CancellationToken ct)
+    /// <summary>The COROS fitness assessment: times as "H:MM:SS", paces per km.</summary>
+    private sealed record WatchFitness(
+        DateOnly Date, double? Vo2Max, double? RunningLevel, string? ThresholdPace, string? FiveKPrediction, string? TenKPrediction,
+        string? HalfMarathonPrediction, string? MarathonPrediction, int? GoalDistancePredictionSeconds);
+
+    private sealed record TrainingLoadState(
+        DateOnly Date, double? ShortTermLoad, double? LongTermLoad, double? LoadRatio, string? Status, double? LongTermLoadFourWeeksAgo,
+        IReadOnlyList<LoadDay> LastTwoWeeks);
+
+    private sealed record LoadDay(DateOnly Date, double? ShortTermLoad, double? LongTermLoad, double? LoadRatio, string? Status);
+
+    private sealed record RecoveryState(DateOnly? RecoveryDate, int? RecoveryPct, double? RestingHrWeekAvg, double? HrvWeekAvg, double? SleepHoursWeekAvg,
+        double? StressWeekAvg);
+
+    private async Task<History> LoadHistoryAsync(Athlete athlete, DateOnly today, double goalKm, CancellationToken ct)
     {
         var since = time.GetUtcNow().AddDays(-56);
         var runs = (await db.Activities.Where(a => a.AthleteId == athlete.Id && a.Source == gateway.Source && a.StartTime >= since).ToListAsync(ct))
             .Where(a => a.IsRun)
-            .Select(a => (Date: AthleteClock.LocalDate(a.StartTime, athlete.TimeZone), a.DistanceKm, a.DurationSeconds, a.AvgPaceSecPerKm, a.AvgHr, a.Name))
+            .Select(a => (Date: AthleteClock.LocalDate(a.StartTime, athlete.TimeZone), Run: a))
             .Where(r => r.Date < today)
             .ToList();
 
         var weeksOfHistory = runs.Count == 0 ? 0 : Math.Min(8, (today.DayNumber - runs.Min(r => r.Date).DayNumber) / 7 + 1);
         var last4 = runs.Where(r => r.Date >= today.AddDays(-28)).ToList();
         var divisor = Math.Clamp(weeksOfHistory, 1, 4);
-
-        var fitnessSince = today.AddDays(-30);
-        var fitness = await db.DailyMetrics
-            .Where(m => m.AthleteId == athlete.Id && m.Source == gateway.Source && m.Date >= fitnessSince && (m.ThresholdPaceSecPerKm != null || m.MarathonPredictionSeconds != null || m.Vo2Max != null))
-            .OrderByDescending(m => m.Date)
-            .FirstOrDefaultAsync(ct);
-
-        var weeklyKm = Enumerable.Range(1, 8).Reverse()
-            .Select(i => Math.Round(runs.Where(r => r.Date >= today.AddDays(-7 * i) && r.Date < today.AddDays(-7 * (i - 1))).Sum(r => r.DistanceKm), 1))
+        var weeks = Enumerable.Range(1, 8).Reverse()
+            .Select(i => runs.Where(r => r.Date >= today.AddDays(-7 * i) && r.Date < today.AddDays(-7 * (i - 1))).Select(r => r.Run).ToList())
             .ToList();
-        return new History(weeklyKm, Math.Round(last4.Sum(r => r.DistanceKm) / divisor, 1), Math.Round(last4.Select(r => r.DistanceKm).DefaultIfEmpty(0).Max(), 1),
+
+        static string? Clock(int? seconds) => seconds is int s ? MessageFormatter.Time(s) : null;
+        WatchFitness? Fitness(WatchMetrics? w) => w?.FitnessDate is not { } date
+            ? null
+            : new WatchFitness(date, w.Vo2Max, w.RunningLevel, w.ThresholdPaceSecPerKm is int p ? MessageFormatter.Pace(p) : null,
+                Clock(w.FiveKPredictionSeconds), Clock(w.TenKPredictionSeconds), Clock(w.HalfMarathonPredictionSeconds), Clock(w.MarathonPredictionSeconds),
+                w.PredictionFor(goalKm));
+
+        var now = await watch.AtAsync(athlete.Id, today, ct);
+        var before = await watch.AtAsync(athlete.Id, today.AddDays(-28), ct);
+        var metricsFrom = today.AddDays(-13);
+        var metrics = await db.DailyMetrics
+            .Where(m => m.AthleteId == athlete.Id && m.Source == gateway.Source && m.Date >= metricsFrom && m.Date <= today)
+            .OrderBy(m => m.Date)
+            .ToListAsync(ct);
+        double? Avg(Func<DailyMetric, double?> f) =>
+            metrics.Where(m => m.Date > today.AddDays(-7)).Select(f).Where(v => v is not null).DefaultIfEmpty(null).Average() is double v ? Math.Round(v, 1) : null;
+
+        var load = now?.LoadDate is not { } loadDate
+            ? null
+            : new TrainingLoadState(loadDate, now.ShortTermLoad, now.LongTermLoad, now.LoadRatio, now.LoadStatus, before?.LongTermLoad,
+                [.. metrics.Where(m => m.AcuteLoad != null || m.ChronicLoad != null || m.LoadRatio != null)
+                    .Select(m => new LoadDay(m.Date, m.AcuteLoad, m.ChronicLoad, m.LoadRatio, m.LoadStatus))]);
+        var recovery = new RecoveryState(now?.RecoveryPct is null ? null : metrics.LastOrDefault(m => m.RecoveryPct != null)?.Date, now?.RecoveryPct,
+            Avg(m => m.RestingHr), Avg(m => m.HrvMs), Avg(m => m.SleepMinutes / 60.0), Avg(m => m.StressAvg));
+
+        return new History(
+            [.. weeks.Select(w => Math.Round(w.Sum(r => r.DistanceKm), 1))],
+            [.. weeks.Select(w => w.Any(r => r.TrainingLoad is not null) ? Math.Round(w.Sum(r => r.TrainingLoad ?? 0)) : (double?)null)],
+            Math.Round(last4.Sum(r => r.Run.DistanceKm) / divisor, 1),
+            Math.Round(last4.Select(r => r.Run.DistanceKm).DefaultIfEmpty(0).Max(), 1),
             weeksOfHistory,
-            [.. last4.OrderByDescending(r => r.Date).Take(20)
-                .Select(r => new RecentRun(r.Date, Math.Round(r.DistanceKm, 1), r.DurationSeconds / 60, r.AvgPaceSecPerKm is int p ? MessageFormatter.Pace(p) : null, r.AvgHr, r.Name))],
-            fitness?.Date, fitness?.ThresholdPaceSecPerKm, fitness?.MarathonPredictionSeconds, fitness?.Vo2Max);
+            [.. runs.OrderByDescending(r => r.Date).Take(40).Select(r => new RecentRun(r.Date, Math.Round(r.Run.DistanceKm, 1), r.Run.DurationSeconds / 60,
+                r.Run.AvgPaceSecPerKm is int p ? MessageFormatter.Pace(p) : null, r.Run.BestKmPaceSecPerKm is int b ? MessageFormatter.Pace(b) : null,
+                r.Run.AvgHr, r.Run.MaxHr, r.Run.ElevationGainM, r.Run.TrainingLoad, r.Run.AerobicTe, r.Run.AnaerobicTe, r.Run.TrainingFocus,
+                r.Run.Performance, r.Run.Name))],
+            Fitness(now),
+            Fitness(before),
+            load,
+            recovery is { RecoveryPct: null, RestingHrWeekAvg: null, HrvWeekAvg: null, SleepHoursWeekAvg: null, StressWeekAvg: null } ? null : recovery,
+            now);
     }
 }

@@ -72,6 +72,7 @@ public sealed class CoachDbContext(DbContextOptions<CoachDbContext> options) : D
             e.Ignore(x => x.DistanceKm);
             e.Ignore(x => x.IsRun);
             e.Property(x => x.RawJson).HasColumnType("jsonb");
+            e.Property(x => x.DetailJson).HasColumnType("jsonb");
             e.HasIndex(x => new { x.Source, x.ExternalId }).IsUnique();
             e.HasOne<Athlete>().WithMany().HasForeignKey(x => x.AthleteId).OnDelete(DeleteBehavior.Cascade);
         });

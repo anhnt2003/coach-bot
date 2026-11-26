@@ -174,7 +174,7 @@ public sealed class FeedbackService(
         var lang = athlete.Language;
         var cat = category.ToString().ToLowerInvariant();
         var paused = await PauseAsync(athlete, $"symptom:{cat}", ct);
-        var message = fmt.T(lang, $"safety.{cat}") + "\n\n" + fmt.T(lang, paused ? "safety.plan_paused" : "safety.no_active_plan");
+        var message = Html.Blocks(fmt.T(lang, $"safety.{cat}"), fmt.T(lang, paused ? "safety.plan_paused" : "safety.no_active_plan"));
 
         await alerts.RaiseAsync(athlete.Id, AlertType.Symptom, category == SymptomCategory.Cardiac ? AlertSeverity.Critical : AlertSeverity.Warning,
             string.IsNullOrWhiteSpace(evidence) ? cat : $"{cat}: {evidence}", null, ct, send: false);

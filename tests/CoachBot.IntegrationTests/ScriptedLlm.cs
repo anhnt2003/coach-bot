@@ -114,7 +114,7 @@ public sealed class ScriptedLlm(Func<LlmRequest, JsonNode, string?> respond) : I
             .FirstOrDefault(s => s!["date"]!.GetValue<string>() == date && s["status"]!.GetValue<string>() == "planned" && s["type"]!.GetValue<string>() != "rest")
             ?["workout_id"]!.GetValue<string>();
 
-    public static JsonObject Readiness(string level = "green", string summary = "Recovery looks normal.", params string[] concerns) => new()
+    public static JsonObject Readiness(string level = "green", string summary = "Recovery looks normal (HRV > baseline & RHR < 50).", params string[] concerns) => new()
     {
         ["level"] = level,
         ["confidence"] = "high",
@@ -129,7 +129,7 @@ public sealed class ScriptedLlm(Func<LlmRequest, JsonNode, string?> respond) : I
         "plan_design" => Design(context),
         "run_analysis" => new JsonObject
         {
-            ["summary"] = "Good, controlled run.",
+            ["summary"] = "Good, controlled run: HR < 160 & steady.",
             ["matched_workout_id"] = PlannedSessionOn(context, context["run"]!["date"]!.GetValue<string>()) ?? "",
             ["pace_status"] = "on_target",
             ["hr_status"] = "in_zone",
@@ -140,11 +140,11 @@ public sealed class ScriptedLlm(Func<LlmRequest, JsonNode, string?> respond) : I
         "daily_check" => new JsonObject
         {
             ["readiness"] = Readiness(),
-            ["advice"] = "Run today's session as planned.",
+            ["advice"] = "Run today's session as planned (HR < 150 & relaxed).",
             ["changes"] = new JsonArray(),
         }.ToJsonString(),
         "symptom_triage" => """{"category":"none","is_current":false,"action":"none","evidence":""}""",
-        "weekly_report" => """{"summary":"Solid week.","focus_next_week":"Keep easy runs easy."}""",
+        "weekly_report" => """{"summary":"Solid week & <steady> HR.","focus_next_week":"Keep easy runs easy."}""",
         _ => null,
     };
 

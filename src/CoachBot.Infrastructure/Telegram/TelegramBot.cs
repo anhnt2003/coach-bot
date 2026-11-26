@@ -7,6 +7,7 @@ using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Telegram.Bot;
+using Telegram.Bot.Exceptions;
 using Telegram.Bot.Polling;
 using Telegram.Bot.Types;
 using Telegram.Bot.Types.Enums;
@@ -54,36 +55,35 @@ public sealed class TelegramNotifier(TelegramClientHolder holder, ICoachDb db, I
         return await SendToChatAsync(holder.Client, chatId.Value, message, ct);
     }
 
+    /// <summary>
+    /// Sends the message as Telegram HTML, split into chunks Telegram accepts. A chunk Telegram cannot parse (a markup
+    /// bug) is sent again as plain text, so the athlete still gets it.
+    /// </summary>
     public static async Task<long?> SendToChatAsync(ITelegramBotClient bot, long chatId, OutboundMessage message, CancellationToken ct)
     {
-        var chunks = Split(message.Text);
+        var chunks = TelegramHtml.Split(message.Text, MaxLength);
         Message? last = null;
         for (var i = 0; i < chunks.Count; i++)
         {
             var markup = i == chunks.Count - 1 && message.Buttons is { Count: > 0 } ? Keyboard(message.Buttons) : null;
-            last = await bot.SendMessage(chatId, chunks[i], ParseMode.None, replyMarkup: markup, cancellationToken: ct);
+            try
+            {
+                last = await bot.SendMessage(chatId, chunks[i], ParseMode.Html, replyMarkup: markup, linkPreviewOptions: NoPreview, cancellationToken: ct);
+            }
+            catch (ApiRequestException ex) when (ex.Message.Contains("can't parse entities", StringComparison.OrdinalIgnoreCase))
+            {
+                last = await bot.SendMessage(chatId, Html.ToPlain(chunks[i]), ParseMode.None, replyMarkup: markup, linkPreviewOptions: NoPreview, cancellationToken: ct);
+            }
         }
 
         return last?.MessageId;
     }
 
+    private static readonly LinkPreviewOptions NoPreview = new() { IsDisabled = true };
+
     public static InlineKeyboardMarkup Keyboard(IReadOnlyList<IReadOnlyList<MessageButton>> rows) =>
         new(rows.Select(r => r.Select(b => InlineKeyboardButton.WithCallbackData(b.Label, b.CallbackData))));
 
-    private static List<string> Split(string text)
-    {
-        var chunks = new List<string>();
-        while (text.Length > MaxLength)
-        {
-            var cut = text.LastIndexOf('\n', MaxLength);
-            cut = cut <= 0 ? MaxLength : cut;
-            chunks.Add(text[..cut]);
-            text = text[cut..].TrimStart('\n');
-        }
-
-        chunks.Add(text);
-        return chunks;
-    }
 }
 
 /// <summary>Long-polling receiver (no public URL needed). Each update is handled in its own DI scope.</summary>
@@ -154,7 +154,7 @@ public sealed class TelegramBotService(
             long? chatId = update.Message?.Chat.Id ?? update.CallbackQuery?.Message?.Chat.Id;
             if (chatId is long id && handler.IsAllowed(id))
             {
-                await bot.SendMessage(id, fmt.T(handler.Language, "error.generic"), cancellationToken: ct);
+                await TelegramNotifier.SendToChatAsync(bot, id, new OutboundMessage(fmt.T(handler.Language, "error.generic")), ct);
             }
         }
     }

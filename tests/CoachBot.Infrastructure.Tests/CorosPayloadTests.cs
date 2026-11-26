@@ -172,24 +172,66 @@ public class CorosTextTests
             Long-Term Load: 75
             Load Ratio: 1.41
             """);
-        Assert.Equal(new CorosText.LoadDay(91, 73, 1.24), load[new DateOnly(2026, 10, 22)]);
+        Assert.Equal(new CorosText.LoadDay(91, 73, 1.24, "Optimized"), load[new DateOnly(2026, 10, 22)]);
         Assert.Equal(1.41, load[new DateOnly(2026, 10, 21)].Ratio);
 
         Assert.Equal(79, CorosText.RecoveryPct("Recovery Status\n\nRecovery: 79%\nLevel: Moderate training recommended"));
 
         var fitness = CorosText.Fitness("""
+            Fitness Assessment Overview
+            ========================
+
             VO2max: 48
             Running Level: 66
             Threshold Pace: 5:57 /km
             5 km Prediction: 28:45
+            10 km Prediction: 1:00:50
             Half Marathon Prediction: 2:18:26
             Marathon Prediction: 4:56:53
             """);
         Assert.NotNull(fitness);
         Assert.Equal(48, fitness.Vo2Max);
+        Assert.Equal(66, fitness.RunningLevel);
+        Assert.Equal(28 * 60 + 45, fitness.FiveKPredictionSeconds);
+        Assert.Equal(3600 + 50, fitness.TenKPredictionSeconds);
         Assert.Equal(5 * 60 + 57, fitness.ThresholdPaceSecPerKm);
         Assert.Equal(2 * 3600 + 18 * 60 + 26, fitness.HalfMarathonPredictionSeconds);
         Assert.Equal(4 * 3600 + 56 * 60 + 53, fitness.MarathonPredictionSeconds);
+    }
+
+    [Fact]
+    public void Activity_detail_is_read_from_the_live_format()
+    {
+        // getActivityDetail as it answered on 2026-11-26.
+        var detail = CorosText.ActivityDetail("""
+            🏃 Outdoor Run Activity Details
+            ========================================
+
+            Workout Time: 51:38
+            Distance: 10.01 km
+            Total Time: 51:38
+            Average Pace: 5:09 /km
+            Moving Average Pace: 5:10 /km
+            Adjusted Pace: 5:10 /km
+            Best Kilometer: 4:43 /km
+            Average Heart Rate: 175 bpm
+            Average Cadence: 175 spm
+            Average Stride Length: 1.11 m
+            Average Power: 241 W
+            Elevation Gain / Loss: 4 m / 10 m
+            Calories: 838 kcal
+            Training Load: 212
+            Aerobic TE: 3.4
+            Anaerobic TE: 4.0
+            Training Focus: Threshold
+            Performance: Best
+            """);
+
+        Assert.NotNull(detail);
+        Assert.Equal((212.0, 3.4, 4.0, "Threshold", "Best"), (detail.TrainingLoad!.Value, detail.AerobicTe!.Value, detail.AnaerobicTe!.Value, detail.TrainingFocus, detail.Performance));
+        Assert.Equal((4 * 60 + 43, 241, 175, 4.0), (detail.BestKmPaceSecPerKm!.Value, detail.AvgPower!.Value, detail.AvgCadence!.Value, detail.ElevationGainM!.Value));
+        Assert.Null(detail.MaxHr);
+        Assert.Null(CorosText.ActivityDetail("Activity not found"));
     }
 
     [Fact]

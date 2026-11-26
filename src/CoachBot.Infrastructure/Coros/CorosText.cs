@@ -13,7 +13,7 @@ namespace CoachBot.Infrastructure.Coros;
 /// </summary>
 public static partial class CorosText
 {
-    public sealed record LoadDay(double? ShortTerm, double? LongTerm, double? Ratio);
+    public sealed record LoadDay(double? ShortTerm, double? LongTerm, double? Ratio, string? Status = null);
 
     public sealed record SleepDay(int? Score, int? Minutes);
 
@@ -93,11 +93,33 @@ public static partial class CorosText
     /// <summary>queryTrainingLoadAssessment: per-day short-term load, long-term load and load ratio.</summary>
     public static IReadOnlyDictionary<DateOnly, LoadDay> TrainingLoad(string text) =>
         DayBlocks(text)
-            .Select(b => (b.Date, Day: new LoadDay(Double(ShortTermLoad(), b.Text), Double(LongTermLoad(), b.Text), Double(LoadRatio(), b.Text))))
-            .Where(x => x.Day.ShortTerm is not null || x.Day.LongTerm is not null || x.Day.Ratio is not null)
+            .Select(b => (b.Date, Day: new LoadDay(Double(ShortTermLoad(), b.Text), Double(LongTermLoad(), b.Text), Double(LoadRatio(), b.Text),
+                Group(LoadComment(), b.Text)?.Trim())))
+            .Where(x => x.Day.ShortTerm is not null || x.Day.LongTerm is not null || x.Day.Ratio is not null || x.Day.Status is not null)
             .ToDictionary(x => x.Date, x => x.Day);
 
-    /// <summary>queryFitnessAssessmentOverview: VO2max, threshold pace and race predictions.</summary>
+    /// <summary>
+    /// getActivityDetail: labelled lines such as "Training Load: 212", "Aerobic TE: 3.4", "Training Focus: Threshold",
+    /// "Performance: Best", "Best Kilometer: 4:43 /km" (verified live 2026-11-26). Null when none of them is there.
+    /// </summary>
+    public static ActivityDetail? ActivityDetail(string text)
+    {
+        var detail = new ActivityDetail(
+            TrainingLoad: Double(DetailTrainingLoad(), text),
+            AerobicTe: Double(AerobicTe(), text),
+            AnaerobicTe: Double(AnaerobicTe(), text),
+            TrainingFocus: Group(TrainingFocus(), text)?.Trim(),
+            Performance: Group(Performance(), text)?.Trim(),
+            BestKmPaceSecPerKm: Group(BestKilometer(), text) is { } best ? ClockSeconds(best) : null,
+            AvgPower: Int(AveragePower(), text),
+            AvgCadence: Int(AverageCadence(), text),
+            MaxHr: Int(MaxHeartRate(), text),
+            ElevationGainM: Double(ElevationGain(), text),
+            RawJson: Raw(text));
+        return detail with { RawJson = null } == new ActivityDetail(null, null, null, null, null, null, null, null, null, null, null) ? null : detail;
+    }
+
+    /// <summary>queryFitnessAssessmentOverview: VO2max, running level, threshold pace and race predictions.</summary>
     public static FitnessSnapshot? Fitness(string text)
     {
         var snapshot = new FitnessSnapshot(
@@ -106,8 +128,11 @@ public static partial class CorosText
             MarathonPredictionSeconds: Group(MarathonPrediction(), text) is { } m ? ClockSeconds(m) : null,
             HalfMarathonPredictionSeconds: Group(HalfMarathonPrediction(), text) is { } h ? ClockSeconds(h) : null,
             LactateThresholdHr: Int(ThresholdHr(), text),
-            RawJson: Raw(text));
-        return snapshot is { Vo2Max: null, ThresholdPaceSecPerKm: null, MarathonPredictionSeconds: null, HalfMarathonPredictionSeconds: null }
+            RawJson: Raw(text),
+            RunningLevel: Double(RunningLevel(), text),
+            FiveKPredictionSeconds: Group(FiveKPrediction(), text) is { } five ? ClockSeconds(five) : null,
+            TenKPredictionSeconds: Group(TenKPrediction(), text) is { } ten ? ClockSeconds(ten) : null);
+        return snapshot is { Vo2Max: null, ThresholdPaceSecPerKm: null, MarathonPredictionSeconds: null, HalfMarathonPredictionSeconds: null, RunningLevel: null }
             ? null
             : snapshot;
     }
@@ -261,4 +286,46 @@ public static partial class CorosText
 
     [GeneratedRegex(@"^Half Marathon Prediction:\s*(?<v>\d+(?::\d{2}){1,2})", RegexOptions.Multiline)]
     private static partial Regex HalfMarathonPrediction();
+
+    [GeneratedRegex(@"^10 ?km Prediction:\s*(?<v>\d+(?::\d{2}){1,2})", RegexOptions.Multiline | RegexOptions.IgnoreCase)]
+    private static partial Regex TenKPrediction();
+
+    [GeneratedRegex(@"^5 ?km Prediction:\s*(?<v>\d+(?::\d{2}){1,2})", RegexOptions.Multiline | RegexOptions.IgnoreCase)]
+    private static partial Regex FiveKPrediction();
+
+    [GeneratedRegex(@"^Running Level:\s*(?<v>\d+(?:\.\d+)?)", RegexOptions.Multiline)]
+    private static partial Regex RunningLevel();
+
+    [GeneratedRegex(@"^Comment:\s*(?<v>[^\n]+)", RegexOptions.Multiline)]
+    private static partial Regex LoadComment();
+
+    [GeneratedRegex(@"^Training Load:\s*(?<v>\d+(?:\.\d+)?)", RegexOptions.Multiline)]
+    private static partial Regex DetailTrainingLoad();
+
+    [GeneratedRegex(@"^Aerobic TE:\s*(?<v>\d+(?:\.\d+)?)", RegexOptions.Multiline)]
+    private static partial Regex AerobicTe();
+
+    [GeneratedRegex(@"^Anaerobic TE:\s*(?<v>\d+(?:\.\d+)?)", RegexOptions.Multiline)]
+    private static partial Regex AnaerobicTe();
+
+    [GeneratedRegex(@"^Training Focus:\s*(?<v>[^\n]+)", RegexOptions.Multiline)]
+    private static partial Regex TrainingFocus();
+
+    [GeneratedRegex(@"^Performance:\s*(?<v>[^\n]+)", RegexOptions.Multiline)]
+    private static partial Regex Performance();
+
+    [GeneratedRegex(@"^Best Kilometer:\s*(?<v>\d+:\d{2})", RegexOptions.Multiline)]
+    private static partial Regex BestKilometer();
+
+    [GeneratedRegex(@"^Average Power:\s*(?<v>\d+)", RegexOptions.Multiline)]
+    private static partial Regex AveragePower();
+
+    [GeneratedRegex(@"^Average Cadence:\s*(?<v>\d+)", RegexOptions.Multiline)]
+    private static partial Regex AverageCadence();
+
+    [GeneratedRegex(@"^Max(?:imum)? Heart Rate:\s*(?<v>\d+)", RegexOptions.Multiline)]
+    private static partial Regex MaxHeartRate();
+
+    [GeneratedRegex(@"^Elevation Gain(?: / Loss)?:\s*(?<v>\d+(?:\.\d+)?)\s*m", RegexOptions.Multiline)]
+    private static partial Regex ElevationGain();
 }

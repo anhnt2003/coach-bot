@@ -6,9 +6,11 @@ namespace CoachBot.Core.Services;
 
 public sealed record DailyMetricPoint(
     DateOnly Date, int? RestingHr, double? HrvMs, int? SleepMinutes, int? SleepScore, int? StressAvg, int? RecoveryPct,
-    double? AcuteLoad, double? ChronicLoad, double? LoadRatio, int? ThresholdPaceSecPerKm, double? Vo2Max);
+    double? AcuteLoad, double? ChronicLoad, double? LoadRatio, string? LoadStatus, int? ThresholdPaceSecPerKm, double? Vo2Max, double? RunningLevel);
 
-public sealed record RunPoint(DateOnly Date, double Km, int DurationMinutes, string? Pace, int? AvgHr, double? TrainingLoad, string? Name);
+public sealed record RunPoint(
+    DateOnly Date, double Km, int DurationMinutes, string? Pace, int? AvgHr, double? TrainingLoad, double? AerobicTe, double? AnaerobicTe,
+    string? TrainingFocus, string? Performance, string? Name);
 
 public sealed record FeedbackPoint(DateOnly Date, int? Rpe, int? Soreness, string? Notes);
 
@@ -35,7 +37,7 @@ public sealed class ReadinessService(ICoachDb db, ICorosGateway gateway, TimePro
             .Where(m => m.AthleteId == athlete.Id && m.Source == gateway.Source && m.Date >= from && m.Date <= today)
             .OrderBy(m => m.Date)
             .Select(m => new DailyMetricPoint(m.Date, m.RestingHr, m.HrvMs, m.SleepMinutes, m.SleepScore, m.StressAvg, m.RecoveryPct,
-                m.AcuteLoad, m.ChronicLoad, m.LoadRatio, m.ThresholdPaceSecPerKm, m.Vo2Max))
+                m.AcuteLoad, m.ChronicLoad, m.LoadRatio, m.LoadStatus, m.ThresholdPaceSecPerKm, m.Vo2Max, m.RunningLevel))
             .ToListAsync(ct);
 
         var since = new DateTimeOffset(from.ToDateTime(TimeOnly.MinValue), TimeSpan.Zero).AddDays(-1);
@@ -44,7 +46,8 @@ public sealed class ReadinessService(ICoachDb db, ICorosGateway gateway, TimePro
                 .OrderBy(a => a.StartTime)
                 .ToListAsync(ct))
             .Select(a => new RunPoint(AthleteClock.LocalDate(a.StartTime, athlete.TimeZone), Math.Round(a.DistanceKm, 1), a.DurationSeconds / 60,
-                a.AvgPaceSecPerKm is int p ? MessageFormatter.Pace(p) : null, a.AvgHr, a.TrainingLoad, a.Name))
+                a.AvgPaceSecPerKm is int p ? MessageFormatter.Pace(p) : null, a.AvgHr, a.TrainingLoad, a.AerobicTe, a.AnaerobicTe, a.TrainingFocus,
+                a.Performance, a.Name))
             .Where(r => r.Date >= from && r.Date <= today)
             .ToList();
 

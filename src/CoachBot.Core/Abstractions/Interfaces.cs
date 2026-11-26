@@ -37,6 +37,9 @@ public interface ICorosGateway
     Task<IReadOnlyList<ActivitySample>> GetActivitiesAsync(Guid athleteId, DateOnly from, DateOnly to, CancellationToken ct);
     Task<IReadOnlyList<DailyMetricSample>> GetDailyMetricsAsync(Guid athleteId, DateOnly from, DateOnly to, CancellationToken ct);
     Task<FitnessSnapshot?> GetFitnessAsync(Guid athleteId, CancellationToken ct);
+
+    /// <summary>One activity's detail (training load, training effect, focus, performance…), or null when unavailable.</summary>
+    Task<ActivityDetail?> GetActivityDetailAsync(Guid athleteId, string externalId, string sportType, CancellationToken ct);
     Task<WorkoutPushResult> PushScheduledWorkoutAsync(Guid athleteId, PlannedWorkout workout, CancellationToken ct);
 }
 
@@ -74,7 +77,8 @@ public sealed record DailyMetricSample(
     double? AcuteLoad = null,
     double? ChronicLoad = null,
     double? LoadRatio = null,
-    string? RawJson = null);
+    string? RawJson = null,
+    string? LoadStatus = null);
 
 public sealed record FitnessSnapshot(
     double? Vo2Max,
@@ -82,6 +86,22 @@ public sealed record FitnessSnapshot(
     int? MarathonPredictionSeconds,
     int? HalfMarathonPredictionSeconds,
     int? LactateThresholdHr,
+    string? RawJson,
+    double? RunningLevel = null,
+    int? FiveKPredictionSeconds = null,
+    int? TenKPredictionSeconds = null);
+
+public sealed record ActivityDetail(
+    double? TrainingLoad,
+    double? AerobicTe,
+    double? AnaerobicTe,
+    string? TrainingFocus,
+    string? Performance,
+    int? BestKmPaceSecPerKm,
+    int? AvgPower,
+    int? AvgCadence,
+    int? MaxHr,
+    double? ElevationGainM,
     string? RawJson);
 
 public sealed record WorkoutPushResult(bool Success, string? ExternalRef, string? Error, bool RequiresManualAction = false);
@@ -138,6 +158,8 @@ public interface INotifier
     Task<long?> SendAsync(Guid athleteId, OutboundMessage message, CancellationToken ct);
 }
 
+/// <param name="Text">Telegram HTML (see <see cref="Services.Html"/>): build it with MessageFormatter.T, which escapes text.</param>
+/// <param name="Buttons">Rows of inline buttons; labels are plain text.</param>
 public sealed record OutboundMessage(string Text, IReadOnlyList<IReadOnlyList<MessageButton>>? Buttons = null);
 
 public sealed record MessageButton(string Label, string CallbackData);
