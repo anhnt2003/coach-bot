@@ -72,11 +72,9 @@ optionally `Llm__Effort`; `Llm__TotalTimeoutSeconds` bounds each call (the proce
 retries API errors itself.
 
 - On the host (`dotnet run`): `claude` must be on PATH (or set `Llm__ClaudePath`) and signed in (`claude login`).
-- In Docker: the image ships the CLI (pinned by the `CLAUDE_CODE_VERSION` build argument). Run
-  `./scripts/use-claude.sh [opus|sonnet]` in your own terminal: it runs `claude setup-token` (approve in the browser),
-  checks the token inside the bot container, writes `Llm__Provider`, `Llm__Model` and `CLAUDE_CODE_OAUTH_TOKEN` to
-  `.env` (keeping `.env.bak`) and restarts the bot. The token is valid for a year; run the script again to renew it.
-  The log warns when the sign-in is less than 14 days from expiry.
+- In Docker: the image ships the CLI (pinned by the `CLAUDE_CODE_VERSION` build argument). Run `claude setup-token`
+  on your machine and put the token in `.env` as `CLAUDE_CODE_OAUTH_TOKEN`; it is valid for a year. The log warns
+  when the sign-in is less than 14 days from expiry.
 
 Anthropic only allows subscription sign-in through its own apps such as the unmodified CLI, for your own use: do not
 copy the sign-in into other code, and use an API key for anything other people use.
