@@ -90,6 +90,13 @@ public static class DependencyInjection
         services.AddSingleton<ILlmCallLog, DbLlmCallLog>();
 
         var limits = config.GetSection(LlmOptions.Section).Get<LlmOptions>() ?? new LlmOptions();
+        if (limits.Provider == LlmOptions.ClaudeCli)
+        {
+            // The CLI retries API errors itself; the process gets the whole TotalTimeoutSeconds budget.
+            services.AddTransient<ILlmClient, ClaudeCliLlmClient>();
+            return;
+        }
+
         void Resilience(IHttpClientBuilder b) => b.AddStandardResilienceHandler(o =>
         {
             o.AttemptTimeout.Timeout = TimeSpan.FromSeconds(limits.TimeoutSeconds);

@@ -13,27 +13,39 @@ using Polly.Timeout;
 
 namespace CoachBot.Infrastructure.Llm;
 
-public sealed class LlmOptions
+public sealed class LlmOptions : IValidatableObject
 {
     public const string Section = "Llm";
+    public const string OpenAiCompatible = "openai_compatible";
+    public const string ClaudeCli = "claude_cli";
 
-    /// <summary>Only openai_compatible: the LLM makes every coaching decision, so the bot does not start without one.</summary>
+    /// <summary>
+    /// openai_compatible (an HTTP chat completions API) or claude_cli (the installed Claude Code CLI, signed in with a
+    /// Claude subscription). The LLM makes every coaching decision, so the bot does not start without one.
+    /// </summary>
     [Required]
-    [RegularExpression("^openai_compatible$")]
-    public string Provider { get; set; } = "openai_compatible";
+    [RegularExpression("^(openai_compatible|claude_cli)$")]
+    public string Provider { get; set; } = OpenAiCompatible;
 
-    /// <summary>Model id exactly as the provider expects it.</summary>
+    /// <summary>Model id exactly as the provider expects it (claude_cli: an alias such as opus or sonnet, or a full name).</summary>
     [Required]
     public string Model { get; set; } = "";
 
     public string? ApiKey { get; set; }
 
-    /// <summary>Chat completions base URL, e.g. https://api.openai.com/v1 or http://localhost:11434/v1.</summary>
-    [Required]
+    /// <summary>openai_compatible only: chat completions base URL, e.g. https://api.openai.com/v1 or http://localhost:11434/v1.</summary>
     public string BaseUrl { get; set; } = "";
 
+    /// <summary>openai_compatible only: claude_cli has no temperature setting.</summary>
     [Range(0, 2)]
     public double Temperature { get; set; } = 0.4;
+
+    /// <summary>claude_cli only: the executable, "claude" when it is on PATH.</summary>
+    public string ClaudePath { get; set; } = "claude";
+
+    /// <summary>claude_cli only: reasoning effort (low, medium, high, xhigh, max); empty keeps the CLI default.</summary>
+    [RegularExpression("^(low|medium|high|xhigh|max)?$")]
+    public string? Effort { get; set; }
 
     /// <summary>Per attempt: the wait for the response headers of the streamed answer.</summary>
     [Range(5, 300)]
@@ -47,6 +59,19 @@ public sealed class LlmOptions
     public int TotalTimeoutSeconds { get; set; } = 900;
 
     public TimeSpan TotalTimeout => TimeSpan.FromSeconds(TotalTimeoutSeconds);
+
+    public IEnumerable<ValidationResult> Validate(ValidationContext validationContext)
+    {
+        if (Provider == OpenAiCompatible && string.IsNullOrWhiteSpace(BaseUrl))
+        {
+            yield return new ValidationResult("Llm:BaseUrl is required for openai_compatible.", [nameof(BaseUrl)]);
+        }
+
+        if (Provider == ClaudeCli && string.IsNullOrWhiteSpace(ClaudePath))
+        {
+            yield return new ValidationResult("Llm:ClaudePath is required for claude_cli.", [nameof(ClaudePath)]);
+        }
+    }
 }
 
 /// <summary>
