@@ -245,7 +245,14 @@ public sealed class StartupChecks(IServiceScopeFactory scopes, IOptions<LlmOptio
             logger.LogError("Database is not reachable; check ConnectionStrings__Postgres");
         }
 
-        logger.LogInformation("LLM: model {Model} at {BaseUrl}", llm.Value.Model, llm.Value.BaseUrl);
+        if (llm.Value.Provider == LlmOptions.ClaudeCli)
+        {
+            logger.LogInformation("LLM: claude_cli model {Model} ({ClaudePath})", llm.Value.Model, llm.Value.ClaudePath);
+        }
+        else
+        {
+            logger.LogInformation("LLM: model {Model} at {BaseUrl}", llm.Value.Model, llm.Value.BaseUrl);
+        }
     }
 
     public Task StopAsync(CancellationToken cancellationToken) => Task.CompletedTask;
