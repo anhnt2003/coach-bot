@@ -95,7 +95,6 @@ public enum RecommendationStatus
     Rejected,
     Expired,
     Undone,
-    Informational,
 }
 
 public enum AlertType
@@ -105,7 +104,6 @@ public enum AlertType
     MissingData,
     SyncFailure,
     CorosAuth,
-    PushFailure,
     AnalysisFailure,
 }
 
@@ -161,13 +159,5 @@ public static class RaceProfiles
         RaceProfile.TenK => Intensity.TenK,
         RaceProfile.Half => Intensity.HalfMarathon,
         _ => Intensity.Marathon,
-    };
-
-    public static string Key(RaceProfile profile) => profile switch
-    {
-        RaceProfile.FiveK => "5k",
-        RaceProfile.TenK => "10k",
-        RaceProfile.Half => "half",
-        _ => "marathon",
     };
 }

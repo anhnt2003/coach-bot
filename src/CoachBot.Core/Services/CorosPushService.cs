@@ -1,12 +1,11 @@
 using CoachBot.Core.Abstractions;
 using CoachBot.Core.Domain;
-using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
 namespace CoachBot.Core.Services;
 
-public sealed record PushSummary(int Pushed, int Updated, int Failed, int ManualActions, string? SkippedReason = null);
+public sealed record PushSummary(int Pushed, int Updated, int Failed, string? SkippedReason = null);
 
 /// <summary>
 /// Rolling push of approved workouts to the COROS calendar. Only the next few days are pushed because COROS tools can
@@ -27,14 +26,14 @@ public sealed class CorosPushService(
         var plan = await plans.GetCurrentPlanAsync(athlete.Id, ct);
         if (plan is null || plan.Status != PlanStatus.Active)
         {
-            return new PushSummary(0, 0, 0, 0, plan is null ? "no_active_plan" : "plan_paused");
+            return new PushSummary(0, 0, 0, plan is null ? "no_active_plan" : "plan_paused");
         }
 
         var caps = await gateway.GetCapabilitiesAsync(athlete.Id, ct);
         if (!caps.CanPushWorkouts)
         {
             logger.LogInformation("COROS push skipped: gateway does not offer workout scheduling tools");
-            return new PushSummary(0, 0, 0, 0, "not_supported");
+            return new PushSummary(0, 0, 0, "not_supported");
         }
 
         var today = AthleteClock.Today(time, athlete.TimeZone);
@@ -111,6 +110,6 @@ public sealed class CorosPushService(
         }
 
         logger.LogInformation("COROS push: {Pushed} new, {Updated} updated, {Failed} failed, {Manual} need manual action", pushed, updated, failed, manual.Count);
-        return new PushSummary(pushed, updated, failed, manual.Count);
+        return new PushSummary(pushed, updated, failed);
     }
 }

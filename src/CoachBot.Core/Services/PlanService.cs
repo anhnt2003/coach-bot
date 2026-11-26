@@ -1,4 +1,3 @@
-using System.Text;
 using CoachBot.Core.Abstractions;
 using CoachBot.Core.Domain;
 using CoachBot.Core.Planning;
@@ -277,7 +276,6 @@ public sealed class PlanService(
         return AssessmentLabels.Contains(key) ? fmt.Text(lang, key) : value ?? "";
     }
 
-    /// <summary>Training history as the LLM sees it: raw numbers, summed and counted but never judged.</summary>
     /// <summary>
     /// Everything the plan is built from, as the LLM sees it: raw numbers, summed and counted but never judged. Weekly
     /// values cover the last 8 full weeks before today, oldest first.

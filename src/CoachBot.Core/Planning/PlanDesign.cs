@@ -194,8 +194,6 @@ public static class PlanDesignMapper
         return new PaceTable(entries, raceKm);
     }
 
-    public static string TypeName(WorkoutType type) => type == WorkoutType.RacePace ? "race_pace" : type.ToString().ToLowerInvariant();
-
     public static string IntensityName(Intensity intensity) => intensity switch
     {
         Intensity.HalfMarathon => "half_marathon",

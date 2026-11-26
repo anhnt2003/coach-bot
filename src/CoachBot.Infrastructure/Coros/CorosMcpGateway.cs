@@ -1,5 +1,4 @@
 using CoachBot.Core.Abstractions;
-using CoachBot.Core.Domain;
 using CoachBot.Core.Services;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;

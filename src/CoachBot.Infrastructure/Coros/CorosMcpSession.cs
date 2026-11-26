@@ -11,10 +11,7 @@ using ModelContextProtocol.Protocol;
 
 namespace CoachBot.Infrastructure.Coros;
 
-public sealed class CorosToolException(string tool, string message) : Exception($"COROS tool {tool} failed: {message}")
-{
-    public string Tool { get; } = tool;
-}
+public sealed class CorosToolException(string tool, string message) : Exception($"COROS tool {tool} failed: {message}");
 
 /// <summary>
 /// One authenticated MCP session per DI scope. Refreshes the access token shortly before expiry, retries read tools

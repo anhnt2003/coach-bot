@@ -46,10 +46,7 @@ public interface ICorosGateway
 /// <summary>The COROS session is missing, expired or revoked; the athlete has to reconnect.</summary>
 public sealed class CorosAuthException(string message) : Exception(message);
 
-public sealed record CorosCapabilities(IReadOnlySet<string> Tools, bool CanRead, bool CanPushWorkouts, bool CanUpdateWorkouts)
-{
-    public static CorosCapabilities None { get; } = new(new HashSet<string>(), false, false, false);
-}
+public sealed record CorosCapabilities(IReadOnlySet<string> Tools, bool CanRead, bool CanPushWorkouts, bool CanUpdateWorkouts);
 
 public sealed record ActivitySample(
     string ExternalId,

@@ -1,6 +1,5 @@
 using CoachBot.Core.Abstractions;
 using CoachBot.Infrastructure;
-using CoachBot.Infrastructure.Coros;
 using CoachBot.Infrastructure.Localization;
 using CoachBot.Infrastructure.Persistence;
 using Microsoft.Extensions.Configuration;

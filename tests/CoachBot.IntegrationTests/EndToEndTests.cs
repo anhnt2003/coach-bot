@@ -3,7 +3,6 @@ using CoachBot.Core.Abstractions;
 using CoachBot.Core.Domain;
 using CoachBot.Core.Planning;
 using CoachBot.Core.Services;
-using CoachBot.Infrastructure.Coros;
 using CoachBot.Infrastructure.Scheduling;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;

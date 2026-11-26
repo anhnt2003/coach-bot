@@ -1,4 +1,3 @@
-using System.Text;
 using CoachBot.Core.Abstractions;
 using CoachBot.Core.Domain;
 using CoachBot.Core.Planning;

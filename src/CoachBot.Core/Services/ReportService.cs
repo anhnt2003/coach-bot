@@ -1,5 +1,4 @@
 using System.Globalization;
-using System.Text;
 using CoachBot.Core.Abstractions;
 using CoachBot.Core.Domain;
 using CoachBot.Core.Planning;
@@ -212,7 +211,7 @@ public sealed class ReportService(
             buttons.AddRange(recMessage.Buttons ?? []);
         }
 
-        var lastRunWithoutRpe = await LastRunWithoutRpeAsync(athlete, today, ct);
+        var lastRunWithoutRpe = await LastRunWithoutRpeAsync(athlete, ct);
         if (lastRunWithoutRpe is not null)
         {
             blocks.Add(fmt.T(lang, "daily.ask_rpe", MessageFormatter.Km(Math.Round(lastRunWithoutRpe.DistanceKm, 1))));
@@ -298,7 +297,7 @@ public sealed class ReportService(
                 : Html.Lines(fmt.T(lang, "weekly.next_week", MessageFormatter.Dates(nextMonday, nextMonday.AddDays(6))), Sessions(lang, plan, nextMonday, nextMonday.AddDays(6)))));
     }
 
-    private async Task<Activity?> LastRunWithoutRpeAsync(Athlete athlete, DateOnly today, CancellationToken ct)
+    private async Task<Activity?> LastRunWithoutRpeAsync(Athlete athlete, CancellationToken ct)
     {
         var since = time.GetUtcNow().AddDays(-2);
         var recent = await db.Activities.Where(a => a.AthleteId == athlete.Id && a.Source == gateway.Source && a.StartTime >= since).OrderByDescending(a => a.StartTime).ToListAsync(ct);
